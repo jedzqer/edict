@@ -1,156 +1,190 @@
 # edict-dev · 三省六部制 AI 协作系统
 
-> **🏛️ 用 1300 年前的帝国智慧，设计现代 AI 协作架构**
-
-
----
-
-## 📁 目录结构
-
-```
-edict-dev/
-├── SKILL.md                    # Skill 定义和使用说明
-├── README.md                   # 本文件
-├── LANGGRAPH.md                # LangGraph 集成指南（重点）
-├── PROTOCOL.md                 # 通信协议
-├── SECURITY.md                 # 安全规范
-├── ESCALATION.md               # 升级机制
-├── models.json.example         # 模型配置示例
-├── langgraph_workflow.py       # LangGraph 工作流 ⭐
-├── roles/                      # 角色提示词
-│   ├── zhongshu.md
-│   ├── menxia.md
-│   ├── shangshu.md
-│   └── ...
-├── tasks/                      # 任务状态目录（运行时自动创建）
-├── history/                    # 历史日志（运行时自动创建）
-└── work/                       # 实体工作区（AI通过Tool操作文件存放处）
-```
+> **🏛️ 用三省六部制组织多 Agent 协作，以当前 LangGraph 实现为准。**
 
 ---
 
-### 快速开始
+## 项目概览
+
+`edict-dev` 是一个基于 LangGraph 的多 Agent 工作流实验项目。当前实现的主链是：
+
+`中书省（规划） → 门下省（初审） → 尚书省（分阶段派发） → 门下省（终验） → finalize`
+
+其中：
+
+- 礼部、兵部、工部由尚书省在内部按阶段派发，同阶段可并行执行
+- 刑部、户部、吏部按语义分析结果作为条件治理节点介入
+- 兵部、礼部、工部可直接使用 `work/` 目录工具
+
+---
+
+## 目录结构
+
+```text
+edict/
+├── README.md
+├── INSTALL.md
+├── SKILL.md
+├── PROTOCOL.md
+├── ESCALATION.md
+├── models.json.example
+├── langgraph_workflow.py
+├── requirements.txt
+├── roles/
+├── tasks/        # 运行后生成的任务产物
+├── history/      # 汇总日志
+├── work/         # 执行部门可操作目录
+└── tasks.db      # SQLite 状态库（运行后生成）
+```
+
+---
+
+## 快速开始
 
 ```bash
-# 1. 安装依赖
-pip install langgraph langchain langchain-openai
+# 1. 创建虚拟环境
+python3 -m venv .venv
+source .venv/bin/activate
 
-# 2. 设置 API Key (当前默认配置为兼容OpenAI接口的平台，如SiliconFlow)
-export DASHSCOPE_API_KEY="your-api-key"
+# 2. 安装依赖
+pip install -r requirements.txt
 
-# 3. 运行工作流 - AI会自动在 work/ 文件夹下生成对应代码
+# 3. 准备模型配置
+cp models.json.example models.json
+
+# 4. 编辑 models.json，填写 model/api_key/temperature
+
+# 5. 运行工作流
 python langgraph_workflow.py "开发一个 Flask API 项目"
 ```
 
-### 核心特性
+---
 
-1. **驳回重做循环** - 门下省审核不通过自动返回中书省重做
-2. **纯粹的职责分离** - 中书省专职项目架构设计，门下省把关审核，尚书省专职任务分发与调度
-3. **原生 Tool Calling** - 各部门 AI 可直接操作 `work/` 工作区，兵部直接**写文件**，工部直接**执行指令**
-4. **越权防护** - LEGAL_FLOWS + ROLE_CAPABILITIES 在代码层与提示词层双重验证执行边界
-5. **尚书省并行调度** - 六部通过 ThreadPoolExecutor 并行执行
-6. **状态持久化** - SQLite + LangGraph Checkpoint
-7. **流式输出** - 实时查看执行进度
+## 核心特性
 
-### 架构图
+1. **驳回重做循环**：门下省审核不通过时自动退回中书省重做。
+2. **职责分离**：中书省负责规划，门下省负责审核，尚书省负责派发和调度。
+3. **原生 Tool Calling**：礼部/兵部/工部可直接读写 `work/`，工部可执行命令。
+4. **合法流转校验**：通过 `LEGAL_FLOWS` 和角色边界限制跨部门越权。
+5. **分阶段调度**：尚书省支持“阶段间串行、阶段内并行”。
+6. **状态留痕**：SQLite、`tasks/{task_id}` 文件和 `history/` 日志同时保留。
+7. **条件治理**：刑部、户部、吏部按需进入治理链路。
 
-```
-┌─────────────────────────────────────────────────────────┐
-│                    START (用户输入)                      │
-└────────────────────┬────────────────────────────────────┘
-                     │
-                     ▼
-            ┌────────────────┐
-            │   中书省节点    │ ←───────────────────────┐
-            │  (planning)    │                         │
-            └────────┬───────┘                         │
-                     │                                 │
-                     ▼                                 │
-            ┌────────────────┐     驳回                │
-            │   门下省节点    │ ────────────────────────┘
-            │   (review)     │
-            └────────┬───────┘
-                     │ 通过
-                     ▼
-            ┌────────────────┐
-            │   尚书省节点    │
-            │ (coordinator)  │
-            └────────┬───────┘
-                     │
-         ┌───────────┼───────────┬──────────┐
-         │           │           │          │
-         ▼           ▼           ▼          ▼
-    ┌────────┐  ┌────────┐  ┌────────┐  ┌────────┐
-    │ 礼部子图│  │ 兵部子图│  │ 工部子图│  │ 户部子图│
-    └────────┘  └────────┘  └────────┘  └────────┘
+---
+
+## 当前架构
+
+```text
+START
+  │
+  ▼
+中书省（规划）
+  │
+  ▼
+门下省（初审）
+  ├─ 不通过 → 中书省重做
+  └─ 通过
+      │
+      ▼
+    尚书省（分阶段派发）
+      ├─ 阶段内并行：礼部 / 兵部 / 工部
+      └─ 条件治理：刑部 / 户部 / 吏部
+              │
+              ▼
+        门下省（终验）
+              │
+              ▼
+           finalize
 ```
 
 ---
 
-## 📚 文档索引
+## 使用方式
 
-### 核心文档
-
-| 文档 | 说明 | 适合人群 |
-|------|------|---------|
-| **[LANGGRAPH.md](LANGGRAPH.md)** | LangGraph 集成指南 | 开发者 |
-| **[SKILL.md](SKILL.md)** | Skill 定义和使用 | 所有用户 |
-| **[langgraph_workflow.py](langgraph_workflow.py)** | LangGraph 实现代码 | 开发者 |
-
-### 文档
-
-| 文档 | 说明 |
-|------|------|
-| **[PROTOCOL.md](PROTOCOL.md)** | 通信协议 |
-| **[SECURITY.md](SECURITY.md)** | 安全规范 |
-
----
-
-## 🚀 使用方式
-
-### 运行 LangGraph 工作流
+CLI：
 
 ```bash
+source .venv/bin/activate
 python langgraph_workflow.py "创建 Python Flask API 项目"
 ```
 
-### 作为 Skill
+Python：
 
 ```python
-from edict.langgraph_workflow import run_langgraph_workflow
+from langgraph_workflow import run_langgraph_workflow
 
 result = run_langgraph_workflow("帮我创建 Flask 项目")
 ```
 
----
+可选开启 LangSmith tracing：
 
-## ✅ 完成状态
-
-| 模块 | 状态 | 备注 |
-|------|------|------|
-| **三省主链** | ✅ 完成 | 中书省(架构设计)→门下省(审核)→尚书省(派发) |
-| **驳回循环** | ✅ 完成 | 门下省→中书省 |
-| **六部子图** | ✅ 完成 | 兵部(写代码)、工部(部署命令)、刑部(安全策略)等 |
-| **工具挂载** | ✅ 完成 | 原生 Tool 调用: `read_file`, `write_file`, `execute_command` (对应角色解锁权限) |
-| **持久化** | ✅ 完成 | SQLite + Checkpoint + `work/`实体目录资源映射 |
-| **依赖管理** | ✅ 完成 | .venv + requirements.txt |
+```bash
+export LANGCHAIN_API_KEY="your-langsmith-key"
+export LANGCHAIN_PROJECT="edict"
+```
 
 ---
 
-## ⚠️ 注意事项
+## 运行产物
 
-1. **依赖安装**: 使用虚拟环境 `source .venv/bin/activate`
-2. **首次运行**: 会自动创建 `tasks.db` SQLite 数据库
+每次运行会在 `tasks/{task_id}/` 下生成：
+
+- `session.log`：当前任务会话日志
+- `*.output`：节点和部门输出
+- `result_langgraph.json`：最终状态快照
+
+全局还会生成：
+
+- `tasks.db`：SQLite 状态库
+- `history/YYYYMMDD.log`：跨任务汇总日志
 
 ---
 
-## 📖 参考资源
+## 文档索引
 
-- **LangGraph 官方文档**: https://docs.langchain.com/oss/python/langgraph/
-- **LangGraph 示例**: https://github.com/langchain-ai/langgraph/tree/main/examples
-- **LangSmith 监控**: https://smith.langchain.com/
-- **edict 主分支**: `<workspace>/skills/edict/`
+| 文档 | 说明 |
+|------|------|
+| [INSTALL.md](INSTALL.md) | 安装、配置与排障 |
+| [SKILL.md](SKILL.md) | Skill 用法与触发建议 |
+| [PROTOCOL.md](PROTOCOL.md) | 通信规则；前半为当前实现约束 |
+| [ESCALATION.md](ESCALATION.md) | 升级/申诉设计；当前未完全自动化 |
+| [models.json.example](models.json.example) | 模型配置模板 |
+| [langgraph_workflow.py](langgraph_workflow.py) | LangGraph 主实现 |
+
+---
+
+## 已实现与未实现
+
+已实现：
+
+- 三省主链
+- 门下省封驳循环
+- 尚书省分阶段派发
+- 礼部/兵部/工部工具执行
+- 刑部/户部/吏部按需治理
+- SQLite 与文件日志留痕
+
+尚未完整自动化：
+
+- “太子”节点
+- 越级汇报自动路由
+- 申诉状态机
+- 公堂协商机制
+
+---
+
+## 注意事项
+
+1. 当前运行依赖已经收敛到 `requirements.txt`，按文件安装即可。
+2. 当前主工作流主要读取 `models.json`；`DASHSCOPE_API_KEY` 不是当前入口的主要配置方式。
+3. `models.json.example` 中的 `provider`、`endpoint` 目前主要用于说明；当前代码实际固定了 OpenAI 兼容 `base_url`。
+4. 升级/申诉机制见 [ESCALATION.md](ESCALATION.md)，但当前只是制度设计，不是完整运行时逻辑。
+
+---
 
 ## 下一步开发
-- 添加一个“公堂”，每个agent都可以发言，将会同时发送给所有agent，用于开会讨论（记得写入各角色提示词）
-- Web可视化监控
+
+- 添加“公堂”协商机制
+- 强化角色在阻塞时的上报与协作提示词
+- 补齐升级/申诉自动化路由
+- Web 可视化监控

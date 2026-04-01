@@ -1,156 +1,117 @@
 # edict-dev 安装指南
 
-## 📦 依赖安装
+## 安装
 
-### 方式一：使用虚拟环境（推荐）
+推荐使用虚拟环境：
 
 ```bash
-# 进入目录
-cd <workspace>/skills/edict-dev
-
-# 创建虚拟环境
+cd /path/to/edict
 python3 -m venv .venv
-
-# 激活虚拟环境
 source .venv/bin/activate
-
-# 安装依赖
 pip install -r requirements.txt
 ```
 
-### 方式二：直接安装到系统（不推荐）
+如果你不使用虚拟环境，至少也需要：
 
 ```bash
-pip install langgraph langchain langchain-dashscope==0.1.8
+pip install -r requirements.txt
 ```
 
 ---
 
-## ✅ 已安装包版本
+## 模型配置
 
-| 包名 | 版本 | 用途 |
-|------|------|------|
-| **langgraph** | 1.1.4 | 图工作流引擎 |
-| **langchain** | 0.3.28 | LangChain 框架 |
-| **langchain-core** | 0.3.83 | LangChain 核心 |
-| **langchain-dashscope** | 0.1.8 | DashScope 集成 |
-| **dashscope** | 1.25.15 | 阿里云通义千问 SDK |
-
----
-
-## 🔑 配置 API Key
-
-使用前需要设置 DashScope API Key：
+当前工作流会读取仓库根目录的 `models.json`：
 
 ```bash
-# 临时设置（当前终端会话）
-export DASHSCOPE_API_KEY="sk-xxxxxxxxxxxxxxxx"
-
-# 永久设置（添加到 ~/.bashrc 或 ~/.zshrc）
-echo 'export DASHSCOPE_API_KEY="sk-xxxxxxxxxxxxxxxx"' >> ~/.bashrc
-source ~/.bashrc
+cp models.json.example models.json
 ```
 
+然后为各角色填写：
+
+- `model`
+- `api_key`
+- `temperature`
+
+当前代码的几个重要事实：
+
+- 主程序使用的是 `langchain_openai.ChatOpenAI`
+- 主程序当前固定使用 `https://api.siliconflow.cn/v1`
+- `models.json.example` 里的 `provider` 和 `endpoint` 目前主要是说明性字段，主流程不会读取它们
+
 ---
 
-## 🚀 运行测试
+## 运行
 
 ```bash
-# 激活虚拟环境
-cd <workspace>/skills/edict-dev
+cd /path/to/edict
 source .venv/bin/activate
-
-# 运行工作流
 python langgraph_workflow.py "创建一个简单的 Flask API"
 ```
 
 ---
 
-## ⚠️ 注意事项
+## 可选配置
 
-### 兼容性问题
-
-`langchain-dashscope==0.1.8` 需要 `langchain-core<1.0.0`，安装时请注意版本：
+如果你想开启 LangSmith tracing：
 
 ```bash
-# ✅ 正确的版本组合
-pip install "langchain-core<1.0.0" "langchain<1.0.0" "langchain-dashscope==0.1.8"
-
-# ❌ 错误的版本组合（会导致导入错误）
-pip install "langchain-core>=1.0.0" "langchain-dashscope==0.1.8"
+export LANGCHAIN_API_KEY="your-langsmith-key"
+export LANGCHAIN_PROJECT="edict"
 ```
-
-### 警告信息
-
-运行时可能会出现以下警告（可以忽略）：
-
-```
-LangChainDeprecationWarning: As of langchain-core 0.3.0, LangChain uses pydantic v2 internally.
-The langchain_core.pydantic_v1 module was a compatibility shim for pydantic v1...
-```
-
-这是 langchain-dashscope 使用旧版 pydantic v1 兼容性模块导致的，不影响功能。
 
 ---
 
-## 📁 虚拟环境管理
+## 运行后会生成什么
+
+通常会看到这些产物：
+
+- `tasks.db`
+- `tasks/{task_id}/session.log`
+- `tasks/{task_id}/*.output`
+- `tasks/{task_id}/result_langgraph.json`
+- `history/YYYYMMDD.log`
+
+---
+
+## 常见问题
+
+### 1. `No module named 'langchain_openai'`
+
+原因：依赖未按 `requirements.txt` 正确安装，或当前虚拟环境未激活。
+
+解决：
 
 ```bash
-# 激活虚拟环境
 source .venv/bin/activate
-
-# 退出虚拟环境
-deactivate
-
-# 查看已安装包
-.venv/bin/pip list
-
-# 更新依赖
-.venv/bin/pip install --upgrade -r requirements.txt
+pip install -r requirements.txt
 ```
+
+### 2. 配了 `DASHSCOPE_API_KEY` 但还是调用失败
+
+原因：当前主工作流不是靠 `DASHSCOPE_API_KEY` 读配置，而是主要读 `models.json`。
+
+解决：
+
+```bash
+cp models.json.example models.json
+```
+
+然后检查每个角色的 `model` 和 `api_key`。
+
+### 3. 改了 `models.json` 里的 `endpoint` 但没有生效
+
+原因：当前代码把 `base_url` 固定在 `langgraph_workflow.py` 里，没有读取 `endpoint`。
+
+解决：
+
+- 如果你使用的是当前默认兼容接口，只需要正确填写 `model` 和 `api_key`
+- 如果你要切换到其他 OpenAI 兼容服务，需要修改 [langgraph_workflow.py](langgraph_workflow.py)
 
 ---
 
-## 🔧 故障排查
+## 说明
 
-### 问题 1：导入错误 `No module named 'langchain_core.pydantic_v1'`
-
-**原因**: langchain-core 版本过高
-
-**解决**:
-```bash
-pip install "langchain-core<1.0.0" "langchain<1.0.0"
-```
-
-### 问题 2：`DASHSCOPE_API_KEY` 未设置
-
-**原因**: 未配置 API Key
-
-**解决**:
-```bash
-export DASHSCOPE_API_KEY="sk-xxxxxxxxxxxxxxxx"
-```
-
-### 问题 3：opencode 未找到
-
-**原因**: opencode 未安装或未在 PATH 中
-
-**解决**:
-```bash
-# 检查 opencode 是否可用
-which opencode
-
-# 如果未安装，参考 opencode skill 文档安装
-```
-
----
-
-## 📖 参考文档
-
-- [LangGraph 官方文档](https://docs.langchain.com/oss/python/langgraph/)
-- [LangChain 文档](https://python.langchain.com/)
-- [DashScope 文档](https://help.aliyun.com/zh/dashscope/)
-- [edict-dev README](README.md)
-- [LANGGRAPH.md](LANGGRAPH.md)
-
----
+- `requirements.txt` 已包含当前主程序所需运行依赖
+- 运行入口是 [langgraph_workflow.py](langgraph_workflow.py)
+- 升级/申诉机制的说明在 [ESCALATION.md](ESCALATION.md)，但当前还没有完整自动化

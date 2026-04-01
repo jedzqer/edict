@@ -5,13 +5,10 @@
 langgraph>=1.0.0
 langgraph-checkpoint>=2.1.0
 
-# LangChain (兼容版本，与 langchain-dashscope 配合)
+# LangChain 核心与 Agent 运行时
 langchain>=0.3.0,<1.0.0
 langchain-core>=0.3.0,<1.0.0
-langchain-dashscope==0.1.8
-
-# DashScope 阿里云通义千问 SDK
-dashscope>=1.14.1
+langchain-openai>=0.3.0
 
 # 其他依赖（自动安装）
 # - pydantic>=2.7.4

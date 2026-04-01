@@ -29,7 +29,7 @@
       "endpoint": "https://dashscope.aliyuncs.com/api/v1",
       "model": "qwen3.5-plus",
       "api_key": "sk-your-dashscope-api-key",
-      "description": "兵部 - 代码开发 (opencode)",
+      "description": "兵部 - 代码开发",
       "temperature": 0.3
     },
     "libu": {
@@ -53,5 +53,5 @@
     "provider": "dashscope",
     "model": "qwen3.5-plus"
   },
-  "notes": "请将此文件重命名为 models.json 并填入你的真实 API 密钥。切勿将真实密钥提交到 Git。"
+  "notes": "请将此文件重命名为 models.json 并填入真实 API 密钥。当前主流程实际读取的核心字段是 model、api_key、temperature；provider 和 endpoint 目前主要用于说明。切勿将真实密钥提交到 Git。"
 }
