@@ -85,16 +85,53 @@ if not _DASHSCOPE_API_KEY:
         "DASHSCOPE_API_KEY 环境变量未设置，请执行：export DASHSCOPE_API_KEY=\"your-api-key\""
     )
 
+# LangSmith 集成（L4）：检测到 LANGCHAIN_API_KEY 时自动启用 tracing
+if os.getenv("LANGCHAIN_API_KEY"):
+    os.environ.setdefault("LANGCHAIN_TRACING_V2", "true")
+    os.environ.setdefault("LANGCHAIN_PROJECT", "edict")
+    global_logger.info("LangSmith tracing 已启用")
+
 try:
     from langchain_dashscope import ChatDashScope
-    llm = ChatDashScope(
-        model="qwen-plus",
-        dashscope_api_key=_DASHSCOPE_API_KEY
+except ImportError as _import_err:
+    raise ImportError(f"无法导入 langchain_dashscope，请执行：pip install langchain-dashscope") from _import_err
+
+
+# ==================== 自定义异常（L3）====================
+
+class EdictExecutionError(RuntimeError):
+    """工作流执行错误，统一错误传播方式，避免字符串前缀检测"""
+    pass
+
+
+# ==================== 模型配置（M2）====================
+
+def _load_model_config() -> Dict[str, Any]:
+    """启动时加载 models.json（若存在），按角色返回配置字典"""
+    models_path = EDICT_DIR / "models.json"
+    if models_path.exists():
+        try:
+            with open(models_path, encoding="utf-8") as f:
+                return json.load(f).get("models", {})
+        except Exception as e:
+            global_logger.warning(f"加载 models.json 失败：{e}，使用默认配置")
+    return {}
+
+
+_MODEL_CONFIG: Dict[str, Any] = _load_model_config()
+
+
+def _get_llm_for_role(role: str) -> "ChatDashScope":
+    """按角色返回 LLM 实例；若 models.json 有对应配置则使用；否则回退到默认"""
+    role_cfg = _MODEL_CONFIG.get(role, {})
+    model = role_cfg.get("model", "qwen-plus")
+    api_key = role_cfg.get("api_key") or _DASHSCOPE_API_KEY
+    temperature = role_cfg.get("temperature", 0.7)
+    return ChatDashScope(
+        model=model,
+        dashscope_api_key=api_key,
+        temperature=temperature,
     )
-except Exception as e:
-    print(f"⚠️  DashScope 初始化失败：{e}")
-    print("请检查 DASHSCOPE_API_KEY 是否有效")
-    llm = None
 
 ROLE_DISPLAY_NAMES = {
     "zhongshu": "中书省",
@@ -189,12 +226,21 @@ def init_db(db_path: Path = DB_PATH) -> sqlite3.Connection:
             review_feedback TEXT,
             revision_count INTEGER DEFAULT 0,
             ministry_results TEXT,
+            governance_plan TEXT,
+            priority TEXT DEFAULT 'P3',
             final_output TEXT,
             created_at TEXT,
             updated_at TEXT,
             status TEXT DEFAULT 'running'
         )
     """)
+    # M4: 迁移旧库，若 priority / governance_plan 列不存在则添加
+    for col, default in [("priority", "'P3'"), ("governance_plan", "'{}'")]:
+        try:
+            conn.execute(f"ALTER TABLE tasks ADD COLUMN {col} TEXT DEFAULT {default}")
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass  # 列已存在
     conn.execute("""
         CREATE TABLE IF NOT EXISTS task_events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -226,8 +272,9 @@ def save_state_to_db(state: Dict[str, Any], db_path: Path = DB_PATH):
         conn.execute("""
             INSERT OR REPLACE INTO tasks
             (task_id, user_input, plan, review_status, review_feedback,
-             revision_count, ministry_results, final_output, created_at, updated_at, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             revision_count, ministry_results, governance_plan, priority,
+             final_output, created_at, updated_at, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             state.get("task_id", ""),
             state.get("user_input", ""),
@@ -236,6 +283,8 @@ def save_state_to_db(state: Dict[str, Any], db_path: Path = DB_PATH):
             state.get("review_feedback", ""),
             state.get("revision_count", 0),
             json.dumps(state.get("ministry_results", {}), ensure_ascii=False),
+            json.dumps(state.get("governance_plan", {}), ensure_ascii=False),
+            state.get("priority", "P3"),
             state.get("final_output", ""),
             state.get("created_at", ""),
             state.get("updated_at", ""),
@@ -280,14 +329,16 @@ def log_event_to_db(task_id: str, event_type: str, node_name: str, message: str,
 # ==================== 状态定义 ====================
 
 class EdictState(TypedDict):
-    """三省六部制状态（与传统版本兼容）"""
+    """三省六部制状态"""
     task_id: str
     user_input: str
     plan: str
     review_status: Literal["pending", "approved", "rejected"]
     review_feedback: str
     revision_count: int
-    ministry_results: Dict[str, str]
+    ministry_results: Dict[str, Dict[str, Any]]   # L2: 结构化输出
+    governance_plan: Dict[str, bool]              # M1: LLM 语义分析后的治理部门清单
+    priority: Literal["P0", "P1", "P2", "P3"]   # M4: 问题优先级
     final_output: str
     created_at: str
     updated_at: str
@@ -323,26 +374,30 @@ def extract_json_from_output(output: str) -> Optional[Dict[str, Any]]:
 
 
 def call_llm_with_retry(system_prompt: str, user_content: str,
-                        max_retries: int = MAX_RETRIES) -> str:
-    """调用 LLM 带重试机制"""
-    last_error = None
+                        max_retries: int = MAX_RETRIES,
+                        role: str = "default") -> str:
+    """调用 LLM 带重试机制（M2: 按角色选择 LLM；L3: 失败时抛出 EdictExecutionError）"""
+    last_error: Optional[Exception] = None
     for attempt in range(1, max_retries + 1):
         try:
+            llm = _get_llm_for_role(role)
             messages = [
                 SystemMessage(content=system_prompt),
                 HumanMessage(content=user_content)
             ]
             response = llm.invoke(messages)
             return response.content
+        except EdictExecutionError:
+            raise
         except Exception as e:
             last_error = e
-            global_logger.warning(f"LLM 调用失败（第 {attempt}/{max_retries} 次）：{e}")
+            global_logger.warning(f"LLM 调用失败（第 {attempt}/{max_retries} 次，角色={role}）：{e}")
             if attempt < max_retries:
                 import time
                 time.sleep(2 ** attempt)
 
-    global_logger.error(f"LLM 调用失败，已重试 {max_retries} 次：{last_error}")
-    return f"Error: LLM 调用失败 - {last_error}"
+    global_logger.error(f"LLM 调用失败，已重试 {max_retries} 次（角色={role}）：{last_error}")
+    raise EdictExecutionError(f"LLM 调用失败（角色={role}）：{last_error}") from last_error
 
 
 def load_role_prompt(role: str) -> str:
@@ -354,8 +409,8 @@ def load_role_prompt(role: str) -> str:
 
 
 def execute_ministry(ministry_key: str, task_desc: str,
-                     state: "EdictState", logger: logging.Logger) -> str:
-    """通过 LLM 执行单个部门任务"""
+                     state: "EdictState", logger: logging.Logger) -> Dict[str, Any]:
+    """通过 LLM 执行单个部门任务，返回结构化结果（L2）"""
     ministry_name = ROLE_DISPLAY_NAMES.get(ministry_key, ministry_key)
     logger.info(f"  → {ministry_name} 开始执行：{task_desc[:80]}...")
     try:
@@ -365,12 +420,15 @@ def execute_ministry(ministry_key: str, task_desc: str,
             f"计划：{state['plan']}\n\n"
             f"派发任务：{task_desc}"
         )
-        result = call_llm_with_retry(role_prompt, context)
+        output = call_llm_with_retry(role_prompt, context, role=ministry_key)
+        logger.info(f"  ← {ministry_name} 执行完成")
+        return {"output": output, "status": "success", "timestamp": datetime.now().isoformat()}
+    except EdictExecutionError as e:
+        logger.error(f"  ← {ministry_name} 执行失败：{e}")
+        return {"output": str(e), "status": "error", "timestamp": datetime.now().isoformat()}
     except Exception as e:
         logger.error(f"  ← {ministry_name} 执行异常：{e}")
-        result = f"Error: {str(e)}"
-    logger.info(f"  ← {ministry_name} 执行完成")
-    return result
+        return {"output": str(e), "status": "error", "timestamp": datetime.now().isoformat()}
 
 
 # ==================== 节点实现 ====================
@@ -418,12 +476,7 @@ def zhongshu_node(state: EdictState) -> EdictState:
 
     user_content = f"用户任务：{state['user_input']}{revision_hint}"
 
-    if llm:
-        plan_text = call_llm_with_retry(system_prompt, user_content)
-    else:
-        raise RuntimeError(
-            "LLM 未初始化，请检查 DASHSCOPE_API_KEY 是否有效。"
-        )
+    plan_text = call_llm_with_retry(system_prompt, user_content, role="zhongshu")
 
     logger.info(f"中书省规划完成，计划长度：{len(plan_text)} 字符")
     log_event_to_db(task_id, "node_complete", "zhongshu", f"规划完成，长度 {len(plan_text)}")
@@ -463,12 +516,7 @@ def menxia_node(state: EdictState) -> EdictState:
 
     user_content = f"请审核以下计划:\n{state['plan']}"
 
-    if llm:
-        review_result = call_llm_with_retry(system_prompt, user_content)
-    else:
-        raise RuntimeError(
-            "LLM 未初始化，请检查 DASHSCOPE_API_KEY 是否有效。"
-        )
+    review_result = call_llm_with_retry(system_prompt, user_content, role="menxia")
 
     logger.info(f"门下省审核结果：{review_result[:200]}...")
 
@@ -505,6 +553,58 @@ def menxia_node(state: EdictState) -> EdictState:
             "review_feedback": review_result,
             "updated_at": datetime.now().isoformat()
         }
+
+
+# ==================== 治理计划辅助函数（M1）====================
+
+def _plan_governance_with_llm(state: "EdictState",
+                               ministry_results: Dict[str, Dict[str, Any]],
+                               logger: logging.Logger) -> Dict[str, bool]:
+    """
+    由 LLM 基于语义分析决定需要哪些治理部门介入（M1）。
+    返回 {"xingbu": bool, "hubu": bool, "libu_admin": bool}。
+    """
+    results_summary = "\n".join(
+        f"- {ROLE_DISPLAY_NAMES.get(k, k)}: {v.get('output', '')[:300]}"
+        for k, v in ministry_results.items()
+    )
+    system_prompt = """你是尚书省协调员，负责判断六部执行结果是否需要额外的治理部门介入。
+
+请根据用户任务、执行计划和六部输出摘要，判断：
+- 刑部（xingbu）：是否存在安全/合规/高风险问题需要审查
+- 户部（hubu）：是否存在资源/预算/成本问题需要评估
+- 吏部（libu_admin）：是否存在角色变更/组织架构/治理问题需要处理
+
+输出必须是 JSON：
+{"xingbu": true/false, "hubu": true/false, "libu_admin": true/false, "reason": "简要说明"}"""
+
+    user_content = (
+        f"用户任务：{state['user_input']}\n\n"
+        f"执行计划摘要：{state['plan'][:500]}\n\n"
+        f"六部执行结果摘要：\n{results_summary}"
+    )
+
+    try:
+        raw = call_llm_with_retry(system_prompt, user_content, role="shangshu")
+        parsed = extract_json_from_output(raw)
+        if parsed and isinstance(parsed, dict):
+            plan = {
+                "xingbu": bool(parsed.get("xingbu", False)),
+                "hubu": bool(parsed.get("hubu", False)),
+                "libu_admin": bool(parsed.get("libu_admin", False)),
+            }
+            logger.info(f"LLM 治理分析（M1）：{parsed.get('reason', '')} → {plan}")
+            return plan
+    except EdictExecutionError as e:
+        logger.warning(f"LLM 治理分析失败，回退到关键词匹配：{e}")
+
+    # 回退到关键词匹配
+    combined = f"{state['user_input']}\n{state['plan']}"
+    return {
+        "xingbu": any(kw in combined for kw in ["生产", "权限", "敏感", "密钥", "删除", "安全", "合规"]),
+        "hubu": any(kw in combined for kw in ["预算", "成本", "配额", "资源", "费用"]),
+        "libu_admin": any(kw in combined for kw in ["角色变更", "部门调整", "治理", "组织架构"]),
+    }
 
 
 def shangshu_node(state: EdictState) -> EdictState:
@@ -544,13 +644,7 @@ def shangshu_node(state: EdictState) -> EdictState:
 审核意见：{state['review_feedback']}
 用户任务：{state['user_input']}"""
 
-        if llm:
-            dispatch_result = call_llm_with_retry(system_prompt, user_content)
-        else:
-            raise RuntimeError(
-                "LLM 未初始化，请检查 DASHSCOPE_API_KEY 是否有效。"
-            )
-
+        dispatch_result = call_llm_with_retry(system_prompt, user_content, role="shangshu")
         plan_json = extract_json_from_output(dispatch_result)
         ministries = plan_json.get("dispatch_log", []) if plan_json else []
 
@@ -573,7 +667,7 @@ def shangshu_node(state: EdictState) -> EdictState:
     logger.info(f"派发任务到 {len(dispatch_map)} 个部门：{list(dispatch_map.keys())}")
 
     # 并行执行六部任务（ThreadPoolExecutor，避免 asyncio 死锁）
-    ministry_results = dict(state.get("ministry_results", {}))
+    ministry_results: Dict[str, Dict[str, Any]] = dict(state.get("ministry_results", {}))
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(dispatch_map) or 1) as executor:
         future_map = {
@@ -587,21 +681,30 @@ def shangshu_node(state: EdictState) -> EdictState:
                 ministry_results[dept_key] = future.result()
             except Exception as exc:
                 logger.error(f"{dept_name} 执行异常：{exc}")
-                ministry_results[dept_key] = f"Error: {exc}"
+                ministry_results[dept_key] = {
+                    "output": str(exc), "status": "error",
+                    "timestamp": datetime.now().isoformat()
+                }
 
-    # 保存结果到文件
+    # 保存结果到文件（L2: 写出 output 字段）
     _validate_task_id(task_id)
     task_dir = TASKS_DIR / task_id
     task_dir.mkdir(parents=True, exist_ok=True)
     for dept_key, result in ministry_results.items():
         output_file = task_dir / f"{dept_key}.output"
-        output_file.write_text(result, encoding="utf-8")
+        output_text = result.get("output", "") if isinstance(result, dict) else str(result)
+        output_file.write_text(output_text, encoding="utf-8")
+
+    # M1: 用 LLM 语义分析决定需要哪些治理部门
+    governance_plan = _plan_governance_with_llm(state, ministry_results, logger)
+    logger.info(f"治理计划：{governance_plan}")
 
     log_event_to_db(task_id, "node_complete", "shangshu",
                     f"六部执行完成，共 {len(ministry_results)} 个结果")
 
     return {
         "ministry_results": ministry_results,
+        "governance_plan": governance_plan,
         "updated_at": datetime.now().isoformat()
     }
 
@@ -659,13 +762,16 @@ def hubu_node(state: EdictState) -> EdictState:
     )
 
     try:
-        result = call_llm_with_retry(role_prompt, context)
-    except Exception as e:
+        result = call_llm_with_retry(role_prompt, context, role="hubu")
+        ministry_result: Dict[str, Any] = {
+            "output": result, "status": "success", "timestamp": datetime.now().isoformat()
+        }
+    except EdictExecutionError as e:
         logger.error(f"户部执行异常：{e}")
-        result = f"Error: {str(e)}"
+        ministry_result = {"output": str(e), "status": "error", "timestamp": datetime.now().isoformat()}
 
     ministry_results = dict(state.get("ministry_results", {}))
-    ministry_results["hubu"] = result
+    ministry_results["hubu"] = ministry_result
 
     log_event_to_db(task_id, "node_complete", "hubu", "户部评估完成")
     return {
@@ -691,26 +797,90 @@ def xingbu_node(state: EdictState) -> EdictState:
         f"计划：{state['plan']}\n\n"
         "各部门执行结果摘要：\n"
         + json.dumps(
-            {k: v[:500] for k, v in state.get("ministry_results", {}).items()},
+            {k: v.get("output", "")[:500] if isinstance(v, dict) else str(v)[:500]
+             for k, v in state.get("ministry_results", {}).items()},
             ensure_ascii=False, indent=2
         )
-        + "\n\n请对以上方案和执行结果进行安全与合规审查。"
+        + "\n\n请对以上方案和执行结果进行安全与合规审查。若存在高风险，在输出 JSON 中包含 \"risk_level\": \"high\" 或 \"critical\"."
     )
 
     try:
-        result = call_llm_with_retry(role_prompt, context)
-    except Exception as e:
+        result = call_llm_with_retry(role_prompt, context, role="xingbu")
+        ministry_result: Dict[str, Any] = {
+            "output": result, "status": "success", "timestamp": datetime.now().isoformat()
+        }
+    except EdictExecutionError as e:
         logger.error(f"刑部执行异常：{e}")
-        result = f"Error: {str(e)}"
+        ministry_result = {"output": str(e), "status": "error", "timestamp": datetime.now().isoformat()}
+        result = str(e)
+
+    # M4: 刹部检测到高风险时，将优先级升级为 P0/P1
+    new_priority = state.get("priority", "P3")
+    parsed_review = extract_json_from_output(result) if isinstance(result, str) else None
+    if parsed_review:
+        risk = str(parsed_review.get("risk_level", "")).lower()
+        if risk == "critical":
+            new_priority = "P0"
+            logger.warning("刑部识别到临界风险，优先级升级为 P0")
+        elif risk == "high":
+            new_priority = "P1"
+            logger.warning("刑部识别到高风险，优先级升级为 P1")
+        log_event_to_db(task_id, "priority_escalation", "xingbu",
+                        f"风险级别={risk}，优先级={new_priority}")
 
     ministry_results = dict(state.get("ministry_results", {}))
-    ministry_results["xingbu"] = result
+    ministry_results["xingbu"] = ministry_result
 
     log_event_to_db(task_id, "node_complete", "xingbu", "刑部审查完成")
     return {
         "ministry_results": ministry_results,
+        "priority": new_priority,
         "updated_at": datetime.now().isoformat()
     }
+
+
+def menxia_final_node(state: EdictState) -> EdictState:
+    """
+    门下省最终验收节点（L1）
+    对六部执行成果做最终质量把关，在 finalize_node 之前执行
+    """
+    task_id = state["task_id"]
+    logger = setup_logger(task_id)
+    logger.info("【门下省·终验】对六部执行成果进行最终验收")
+    log_event_to_db(task_id, "node_start", "menxia_final", "门下省开始终验")
+
+    results_summary = "\n".join(
+        f"- {ROLE_DISPLAY_NAMES.get(k, k)}（{v.get('status', '?')}）: "
+        f"{v.get('output', '')[:400] if isinstance(v, dict) else str(v)[:400]}"
+        for k, v in state.get("ministry_results", {}).items()
+    )
+
+    system_prompt = """你是门下省侍中，负责对六部执行成果进行最终质量验收。
+
+请检查：
+1. 各部门执行结果是否完整、无明显错误
+2. 整体方案是否满足用户原始需求
+3. 是否存在安全或合规遗漏
+
+输出 JSON：
+{"verdict": "通过" 或 "存疑", "summary": "验收意见", "issues": ["问题1（如无则为空列表）"]}"""
+
+    user_content = (
+        f"用户原始任务：{state['user_input']}\n\n"
+        f"计划：{state['plan'][:500]}\n\n"
+        f"各部门执行结果：\n{results_summary}"
+    )
+
+    try:
+        review = call_llm_with_retry(system_prompt, user_content, role="menxia")
+    except EdictExecutionError as e:
+        logger.warning(f"门下省终验调用失败，跳过：{e}")
+        review = '{"verdict": "通过", "summary": "终验跳过（LLM 调用失败）", "issues": []}'
+
+    log_event_to_db(task_id, "node_complete", "menxia_final", f"终验完成：{review[:200]}")
+    logger.info(f"门下省终验结果：{review[:200]}")
+
+    return {"updated_at": datetime.now().isoformat()}
 
 
 def finalize_node(state: EdictState) -> EdictState:
@@ -724,7 +894,7 @@ def finalize_node(state: EdictState) -> EdictState:
     log_event_to_db(task_id, "node_start", "finalize", "开始汇总")
 
     ministry_reports = "\n\n".join([
-        f"### {ROLE_DISPLAY_NAMES.get(m, m)}\n{result[:1000]}"
+        f"### {ROLE_DISPLAY_NAMES.get(m, m)}\n{result.get('output', '') if isinstance(result, dict) else str(result)[:1000]}"
         for m, result in state.get("ministry_results", {}).items()
     ])
 
@@ -751,22 +921,15 @@ def finalize_node(state: EdictState) -> EdictState:
 各部门报告:
 {ministry_reports}"""
 
-    if llm:
-        final_report = call_llm_with_retry(system_prompt, user_content)
-    else:
-        final_report = f"""# 执行总结
-
-## 任务概述
-用户请求：{state['user_input']}
-
-## 各部门执行情况
-{ministry_reports}
-
-## 最终结论
-任务执行完成。
-
-## 修订次数
-共 {state.get('revision_count', 0)} 次规划修订。"""
+    try:
+        final_report = call_llm_with_retry(system_prompt, user_content, role="final")
+    except EdictExecutionError:
+        final_report = (
+            f"# 执行总结\n\n## 任务概述\n用户请求：{state['user_input']}\n\n"
+            f"## 各部门执行情况\n{ministry_reports}\n\n"
+            f"## 最终结论\n任务执行完成（汇总节点 LLM 调用失败，输出降级）。\n\n"
+            f"## 修订次数\n共 {state.get('revision_count', 0)} 次规划修订。"
+        )
 
     logger.info(f"最终报告生成完成，长度：{len(final_report)} 字符")
     log_event_to_db(task_id, "node_complete", "finalize", f"报告长度 {len(final_report)}")
@@ -810,74 +973,33 @@ def after_review_route(state: EdictState) -> Literal["zhongshu_node", "shangshu_
     return END
 
 
-def should_run_governance(state: EdictState) -> Literal["libu_admin_node", "hubu_node", "xingbu_node", "finalize_node"]:
+def should_run_governance(state: EdictState) -> Literal["libu_admin_node", "hubu_node", "xingbu_node", "menxia_final_node"]:
     """
-    条件触发吏部/户部/刑部的路由决策
-
-    触发规则：
-    - 刑部：涉及生产环境、权限、敏感数据、删除操作等高风险关键词
-    - 户部：涉及预算、成本、配额、资源限制等关键词
-    - 吏部：涉及角色变更、能力登记、部门调整等关键词
+    根据尚书省生成的 governance_plan（LLM 语义分析结果，M1）决定首个治理节点。
+    若无需治理直接进入门下省终验。
     """
-    combined_text = f"{state['user_input']}\n{state['plan']}\n{state.get('review_feedback', '')}"
-
-    xingbu_keywords = [
-        "生产", "prod", "权限", "敏感", "密码", "密钥", "token",
-        "删除", "drop", "truncate", "rm -rf", "sudo", "root",
-        "安全", "合规", "审计", "越权", "注入", "泄露", "高风险",
-        "上线", "发布", "配置替换", "数据库迁移"
-    ]
-    if any(kw in combined_text for kw in xingbu_keywords):
+    plan = state.get("governance_plan", {})
+    if plan.get("xingbu"):
         return "xingbu_node"
-
-    hubu_keywords = [
-        "预算", "成本", "配额", "资源", "限量", "多模型",
-        "费用", "token 限制", "调用次数", "配额不足", "经济",
-        "优化成本", "资源评估"
-    ]
-    if any(kw in combined_text for kw in hubu_keywords):
+    if plan.get("hubu"):
         return "hubu_node"
-
-    libu_admin_keywords = [
-        "角色变更", "能力登记", "部门调整", "名册", "替补",
-        "路由", "可用性", "治理", "组织架构"
-    ]
-    if any(kw in combined_text for kw in libu_admin_keywords):
+    if plan.get("libu_admin"):
         return "libu_admin_node"
+    return "menxia_final_node"
 
-    return "finalize_node"
 
-
-def after_governance_route(state: EdictState) -> Literal["libu_admin_node", "hubu_node", "xingbu_node", "finalize_node"]:
-    """治理节点后的路由，检查是否还有其他治理节点需要执行"""
-    combined_text = f"{state['user_input']}\n{state['plan']}\n{state.get('review_feedback', '')}"
+def after_governance_route(state: EdictState) -> Literal["libu_admin_node", "hubu_node", "xingbu_node", "menxia_final_node"]:
+    """治理节点后继续检查 governance_plan，执行未完成的治理节点"""
+    plan = state.get("governance_plan", {})
     results = state.get("ministry_results", {})
 
-    xingbu_keywords = [
-        "生产", "prod", "权限", "敏感", "密码", "密钥", "token",
-        "删除", "drop", "truncate", "rm -rf", "sudo", "root",
-        "安全", "合规", "审计", "越权", "注入", "泄露", "高风险",
-        "上线", "发布", "配置替换", "数据库迁移"
-    ]
-    if "xingbu" not in results and any(kw in combined_text for kw in xingbu_keywords):
+    if plan.get("xingbu") and "xingbu" not in results:
         return "xingbu_node"
-
-    hubu_keywords = [
-        "预算", "成本", "配额", "资源", "限量", "多模型",
-        "费用", "token 限制", "调用次数", "配额不足", "经济",
-        "优化成本", "资源评估"
-    ]
-    if "hubu" not in results and any(kw in combined_text for kw in hubu_keywords):
+    if plan.get("hubu") and "hubu" not in results:
         return "hubu_node"
-
-    libu_admin_keywords = [
-        "角色变更", "能力登记", "部门调整", "名册", "替补",
-        "路由", "可用性", "治理", "组织架构"
-    ]
-    if "libu_admin" not in results and any(kw in combined_text for kw in libu_admin_keywords):
+    if plan.get("libu_admin") and "libu_admin" not in results:
         return "libu_admin_node"
-
-    return "finalize_node"
+    return "menxia_final_node"
 
 
 # ==================== 构建工作流 ====================
@@ -893,6 +1015,7 @@ def create_edict_workflow():
     workflow.add_node("libu_admin_node", libu_admin_node)
     workflow.add_node("hubu_node", hubu_node)
     workflow.add_node("xingbu_node", xingbu_node)
+    workflow.add_node("menxia_final_node", menxia_final_node)   # L1
     workflow.add_node("finalize_node", finalize_node)
 
     # 主链
@@ -910,7 +1033,7 @@ def create_edict_workflow():
         }
     )
 
-    # 尚书省执行完毕 → 条件治理路由
+    # 尚书省执行完毕 → 条件治理路由（M1: 基于 governance_plan）
     workflow.add_conditional_edges(
         "shangshu_node",
         should_run_governance,
@@ -918,18 +1041,18 @@ def create_edict_workflow():
             "xingbu_node": "xingbu_node",
             "hubu_node": "hubu_node",
             "libu_admin_node": "libu_admin_node",
-            "finalize_node": "finalize_node",
+            "menxia_final_node": "menxia_final_node",
         }
     )
 
-    # 治理节点链式路由（每个节点执行完后检查是否还需其他治理节点）
+    # 治理节点链式路由，均最终流向门下省终验节点（L1）
     workflow.add_conditional_edges(
         "xingbu_node",
         after_governance_route,
         {
             "hubu_node": "hubu_node",
             "libu_admin_node": "libu_admin_node",
-            "finalize_node": "finalize_node",
+            "menxia_final_node": "menxia_final_node",
         }
     )
     workflow.add_conditional_edges(
@@ -938,7 +1061,7 @@ def create_edict_workflow():
         {
             "xingbu_node": "xingbu_node",
             "libu_admin_node": "libu_admin_node",
-            "finalize_node": "finalize_node",
+            "menxia_final_node": "menxia_final_node",
         }
     )
     workflow.add_conditional_edges(
@@ -947,10 +1070,11 @@ def create_edict_workflow():
         {
             "xingbu_node": "xingbu_node",
             "hubu_node": "hubu_node",
-            "finalize_node": "finalize_node",
+            "menxia_final_node": "menxia_final_node",
         }
     )
 
+    workflow.add_edge("menxia_final_node", "finalize_node")   # L1
     workflow.add_edge("finalize_node", END)
 
     # 编译（带内存检查点，支持状态恢复）
@@ -991,6 +1115,8 @@ def run_langgraph_workflow(user_input: str, task_id: Optional[str] = None):
         "review_feedback": "",
         "revision_count": 0,
         "ministry_results": {},
+        "governance_plan": {},
+        "priority": "P3",
         "final_output": "",
         "created_at": datetime.now().isoformat(),
         "updated_at": datetime.now().isoformat()
@@ -1009,7 +1135,10 @@ def run_langgraph_workflow(user_input: str, task_id: Optional[str] = None):
     print(f"用户输入：{user_input}")
     print("\n🚀 开始执行任务...\n")
 
-    try:
+    # M3: 全局超时保护（默认 1800s，可通过 EDICT_TIMEOUT 覆盖）
+    global_timeout = int(os.getenv("EDICT_TIMEOUT", "1800"))
+
+    def _run_workflow() -> Optional[Dict[str, Any]]:
         for event in app.stream(initial_state, config):
             for node_name, output in event.items():
                 display_name = ROLE_DISPLAY_NAMES.get(node_name, node_name)
@@ -1032,7 +1161,6 @@ def run_langgraph_workflow(user_input: str, task_id: Optional[str] = None):
             final_output = final_state.values.get("final_output", "")
             print(f"\n最终输出:\n{final_output[:1000]}...")
 
-            # 保存结果
             task_dir = TASKS_DIR / task_id
             task_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1042,7 +1170,6 @@ def run_langgraph_workflow(user_input: str, task_id: Optional[str] = None):
                 encoding="utf-8"
             )
 
-            # 更新数据库状态
             completed_state = dict(final_state.values)
             completed_state["status"] = "completed"
             save_state_to_db(completed_state)
@@ -1052,15 +1179,27 @@ def run_langgraph_workflow(user_input: str, task_id: Optional[str] = None):
             logger.info(f"结果已保存到：{result_file}")
 
             return final_state.values
-        else:
-            logger.error("最终状态为空")
-            return None
+        return None
+
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as _exec:
+            _future = _exec.submit(_run_workflow)
+            try:
+                return _future.result(timeout=global_timeout)
+            except concurrent.futures.TimeoutError:
+                logger.error(f"工作流全局超时（{global_timeout}s），强制终止")
+                log_event_to_db(task_id, "workflow_timeout", None, f"超时 {global_timeout}s")
+                error_state = dict(initial_state)
+                error_state["status"] = "timeout"
+                error_state["final_output"] = f"Error: 工作流超时（{global_timeout}s）"
+                save_state_to_db(error_state)
+                print(f"\n❌ 工作流超时（{global_timeout}s）")
+                return None
 
     except Exception as e:
         logger.error(f"执行失败：{e}", exc_info=True)
         log_event_to_db(task_id, "workflow_error", None, str(e))
 
-        # 更新数据库状态为失败
         error_state = initial_state.copy()
         error_state["status"] = "error"
         error_state["final_output"] = f"Error: {str(e)}"
