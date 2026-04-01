@@ -1,37 +1,31 @@
 #!/usr/bin/env python3
 """
-edict LangGraph 工作流协调器 - 三省六部制 AI 协作系统 (LangGraph 版本)
+edict LangGraph 工作流协调器 - 三省六部制 AI 协作系统
 
-使用 LangGraph 重构的 edict 工作流，支持：
+使用 LangGraph 实现的 edict 工作流，支持：
 - 原生循环（驳回重做）
 - 状态持久化（SQLite + Checkpoint）
-- 子图嵌套（六部）
+- 六部并行执行（ThreadPoolExecutor）
 - Human-in-the-Loop
 
-执行引擎：
-- 中书省、门下省、尚书省、六部：LangGraph Node
-- 兵部、工部：opencode（通过 tool 集成）
-- 其他部门：nanobot agent（通过 tool 集成）
+所有部门均通过 LLM（DashScope）执行任务，无外部工具依赖。
 """
 
 import json
 import os
 import re
 import sqlite3
-import subprocess
-import asyncio
 import logging
+import concurrent.futures
 from pathlib import Path
 from datetime import datetime
-from typing import Literal, Annotated, TypedDict, Dict, Any, Optional, List
+from typing import Literal, TypedDict, Dict, Any, Optional
 from contextlib import contextmanager
-import operator
 
 # LangGraph 核心
 from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import MemorySaver
 from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_core.tools import tool
 
 # 路径配置
 EDICT_DIR = Path(__file__).parent
@@ -45,8 +39,6 @@ HISTORY_DIR.mkdir(parents=True, exist_ok=True)
 
 MAX_REVISIONS = 3
 MAX_RETRIES = 3
-OPENCODE_TIMEOUT = 600
-NANOBOT_TIMEOUT = 180
 
 # ==================== 日志系统 ====================
 
@@ -104,9 +96,6 @@ except Exception as e:
     print("请检查 DASHSCOPE_API_KEY 是否有效")
     llm = None
 
-BINGBU_USE_OPENCODE = True
-GONGBU_USE_OPENCODE = True
-
 ROLE_DISPLAY_NAMES = {
     "zhongshu": "中书省",
     "menxia": "门下省",
@@ -139,6 +128,50 @@ DEPARTMENT_NAME_MAP = {
 def normalize_department(name: str) -> Optional[str]:
     """将中文部门名或英文名标准化为内部 key"""
     return DEPARTMENT_NAME_MAP.get(name)
+
+
+# ==================== 权限管理 ====================
+
+LEGAL_FLOWS = {
+    ("zhongshu", "menxia"),
+    ("menxia",   "zhongshu"),   # 驳回重做
+    ("menxia",   "shangshu"),
+    ("shangshu", "libu_admin"),
+    ("shangshu", "hubu"),
+    ("shangshu", "libu"),
+    ("shangshu", "bingbu"),
+    ("shangshu", "xingbu"),
+    ("shangshu", "gongbu"),
+}
+
+ROLE_CAPABILITIES: Dict[str, set] = {
+    "zhongshu":   {"规划"},
+    "menxia":     {"审核"},
+    "shangshu":   {"协调"},
+    "libu_admin": {"组织治理"},
+    "hubu":       {"资源治理"},
+    "libu":       {"文事执行"},
+    "bingbu":     {"技术执行"},
+    "xingbu":     {"风险审查"},
+    "gongbu":     {"工事执行"},
+}
+
+
+def validate_flow(from_role: str, to_role: str, logger: logging.Logger) -> bool:
+    """检查流转是否合法；不合法则记录审计日志并返回 False"""
+    if (from_role, to_role) not in LEGAL_FLOWS:
+        logger.error(
+            f"FLOW_VIOLATION: 检测到非法流转 {from_role} → {to_role}"
+        )
+        return False
+    return True
+
+
+def _validate_task_id(task_id: str) -> str:
+    """校验 task_id 只允许安全字符，防止路径遍历"""
+    if not re.match(r'^[a-zA-Z0-9_\-\.]+$', task_id):
+        raise ValueError(f"非法 task_id：{task_id!r}")
+    return task_id
 
 
 # ==================== SQLite 持久化 ====================
@@ -261,104 +294,6 @@ class EdictState(TypedDict):
     status: str
 
 
-class MinistryState(TypedDict):
-    """六部子图状态"""
-    task: str
-    project_dir: Optional[str]
-    output: str
-    context: str
-
-
-# ==================== 工具定义 ====================
-
-@tool
-def run_opencode_task(task_description: str, project_dir: Optional[str] = None) -> str:
-    """执行 opencode 代码任务（兵部/工部使用）"""
-    env = os.environ.copy()
-    env["PATH"] = f"/usr/sbin:/usr/bin:/sbin:/bin:{env.get('PATH', '')}"
-
-    cmd = ["opencode", "run", "--format", "json"]
-    if project_dir and Path(project_dir).exists():
-        cmd.extend(["--dir", str(project_dir)])
-    cmd.append(task_description)
-
-    try:
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=OPENCODE_TIMEOUT, env=env
-        )
-        if result.returncode == 0:
-            try:
-                output_data = json.loads(result.stdout)
-                return json.dumps(output_data, indent=2, ensure_ascii=False)
-            except json.JSONDecodeError:
-                return result.stdout
-        else:
-            return f"Error: {result.stderr}\nOutput: {result.stdout}"
-    except subprocess.TimeoutExpired:
-        return f"Error: 执行超时（{OPENCODE_TIMEOUT // 60} 分钟）"
-    except Exception as e:
-        return f"Error: {str(e)}"
-
-
-def _validate_task_id(task_id: str) -> str:
-    """校验 task_id 只允许安全字符，防止路径遍历"""
-    import re as _re
-    if not _re.match(r'^[a-zA-Z0-9_\-\.]+$', task_id):
-        raise ValueError(f"非法 task_id：{task_id!r}")
-    return task_id
-
-
-@tool
-def spawn_nanobot_agent(role: str, input_context: str, task_id: str) -> str:
-    """调用 nanobot agent 执行角色任务"""
-    _validate_task_id(task_id)
-    task_dir = TASKS_DIR / task_id
-    task_dir.mkdir(parents=True, exist_ok=True)
-    output_file = task_dir / f"{role}.output"
-
-    role_prompt_file = ROLES_DIR / f"{role}.md"
-    if not role_prompt_file.exists():
-        return f"Error: 角色提示词不存在：{role}"
-
-    role_prompt = role_prompt_file.read_text(encoding="utf-8")
-
-    agent_task = f"""{role_prompt}
-
----
-## 任务上下文
-{input_context}
-
----
-## 输出要求
-1. 将完整输出写入：{output_file}
-2. 输出必须是有效的 JSON 格式
-3. 完成后确保输出文件存在
-
-开始执行。
-"""
-
-    try:
-        env = os.environ.copy()
-        env["PATH"] = f"/usr/sbin:/usr/bin:/sbin:/bin:{env.get('PATH', '')}"
-
-        result = subprocess.run(
-            ["nanobot", "agent", "--message", agent_task, "--no-markdown"],
-            capture_output=True,
-            text=True,
-            timeout=NANOBOT_TIMEOUT,
-            env=env,
-        )
-
-        if result.returncode == 0:
-            output_content = result.stdout
-            output_file.write_text(output_content, encoding="utf-8")
-            return output_content
-        else:
-            return f"Error: {result.stderr}\nOutput: {result.stdout}"
-    except subprocess.TimeoutExpired:
-        return f"Error: 执行超时（{NANOBOT_TIMEOUT} 秒）"
-    except Exception as e:
-        return f"Error: {str(e)}"
 
 
 # ==================== 辅助函数 ====================
@@ -418,44 +353,24 @@ def load_role_prompt(role: str) -> str:
     return role_file.read_text(encoding="utf-8")
 
 
-def execute_ministry_async(ministry_key: str, task_desc: str,
-                           state: EdictState, logger: logging.Logger) -> str:
-    """同步执行六部任务（用于 asyncio.gather 包装）"""
-    task_id = state["task_id"]
+def execute_ministry(ministry_key: str, task_desc: str,
+                     state: "EdictState", logger: logging.Logger) -> str:
+    """通过 LLM 执行单个部门任务"""
     ministry_name = ROLE_DISPLAY_NAMES.get(ministry_key, ministry_key)
     logger.info(f"  → {ministry_name} 开始执行：{task_desc[:80]}...")
-
     try:
-        if ministry_key in ("bingbu", "gongbu"):
-            role_prompt = load_role_prompt(ministry_key)
-            full_task = f"{role_prompt}\n\n---\n## 任务\n{task_desc}\n\n用户原始请求：{state['user_input']}"
-            result = run_opencode_task.invoke({
-                "task_description": full_task,
-                "project_dir": None
-            })
-        else:
-            role_prompt = load_role_prompt(ministry_key)
-            context = f"用户请求：{state['user_input']}\n\n计划：{state['plan']}\n\n派发任务：{task_desc}"
-            result = spawn_nanobot_agent.invoke({
-                "role": ministry_key,
-                "input_context": context,
-                "task_id": task_id
-            })
+        role_prompt = load_role_prompt(ministry_key)
+        context = (
+            f"用户请求：{state['user_input']}\n\n"
+            f"计划：{state['plan']}\n\n"
+            f"派发任务：{task_desc}"
+        )
+        result = call_llm_with_retry(role_prompt, context)
     except Exception as e:
         logger.error(f"  ← {ministry_name} 执行异常：{e}")
         result = f"Error: {str(e)}"
-
     logger.info(f"  ← {ministry_name} 执行完成")
     return result
-
-
-async def execute_ministry_coro(ministry_key: str, task_desc: str,
-                                 state: EdictState, logger: logging.Logger) -> str:
-    """异步包装六部任务执行"""
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(
-        None, execute_ministry_async, ministry_key, task_desc, state, logger
-    )
 
 
 # ==================== 节点实现 ====================
@@ -506,11 +421,9 @@ def zhongshu_node(state: EdictState) -> EdictState:
     if llm:
         plan_text = call_llm_with_retry(system_prompt, user_content)
     else:
-        plan_text = spawn_nanobot_agent.invoke({
-            "role": "zhongshu",
-            "input_context": user_content,
-            "task_id": task_id
-        })
+        raise RuntimeError(
+            "LLM 未初始化，请检查 DASHSCOPE_API_KEY 是否有效。"
+        )
 
     logger.info(f"中书省规划完成，计划长度：{len(plan_text)} 字符")
     log_event_to_db(task_id, "node_complete", "zhongshu", f"规划完成，长度 {len(plan_text)}")
@@ -553,11 +466,9 @@ def menxia_node(state: EdictState) -> EdictState:
     if llm:
         review_result = call_llm_with_retry(system_prompt, user_content)
     else:
-        review_result = spawn_nanobot_agent.invoke({
-            "role": "menxia",
-            "input_context": user_content,
-            "task_id": task_id
-        })
+        raise RuntimeError(
+            "LLM 未初始化，请检查 DASHSCOPE_API_KEY 是否有效。"
+        )
 
     logger.info(f"门下省审核结果：{review_result[:200]}...")
 
@@ -636,11 +547,9 @@ def shangshu_node(state: EdictState) -> EdictState:
         if llm:
             dispatch_result = call_llm_with_retry(system_prompt, user_content)
         else:
-            dispatch_result = spawn_nanobot_agent.invoke({
-                "role": "shangshu",
-                "input_context": user_content,
-                "task_id": task_id
-            })
+            raise RuntimeError(
+                "LLM 未初始化，请检查 DASHSCOPE_API_KEY 是否有效。"
+            )
 
         plan_json = extract_json_from_output(dispatch_result)
         ministries = plan_json.get("dispatch_log", []) if plan_json else []
@@ -650,48 +559,38 @@ def shangshu_node(state: EdictState) -> EdictState:
         logger.warning("未解析到任何部门任务，使用默认兵部任务")
         ministries = [{"name": "兵部", "task": state["user_input"]}]
 
-    # 构建派发映射
+    # 构建派发映射，并检查每个派发是否合法流转
     dispatch_map = {}
     for m in ministries:
         dept_name = m.get("name", "")
         dept_key = normalize_department(dept_name)
         if dept_key:
-            dispatch_map[dept_key] = m.get("task", "")
+            if validate_flow("shangshu", dept_key, logger):
+                dispatch_map[dept_key] = m.get("task", "")
+            else:
+                logger.warning(f"跳过非法派发目标：{dept_name}")
 
     logger.info(f"派发任务到 {len(dispatch_map)} 个部门：{list(dispatch_map.keys())}")
 
-    # 并行执行六部任务
+    # 并行执行六部任务（ThreadPoolExecutor，避免 asyncio 死锁）
     ministry_results = dict(state.get("ministry_results", {}))
 
-    async def run_all_ministries():
-        tasks = []
-        for dept_key, task_desc in dispatch_map.items():
-            tasks.append(
-                execute_ministry_coro(dept_key, task_desc, state, logger)
-            )
-        return await asyncio.gather(*tasks, return_exceptions=True)
-
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        loop = None
-
-    if loop and loop.is_running():
-        import concurrent.futures
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-            results = pool.submit(asyncio.run, run_all_ministries()).result()
-    else:
-        results = asyncio.run(run_all_ministries())
-
-    for (dept_key, _), result in zip(dispatch_map.items(), results):
-        dept_name = ROLE_DISPLAY_NAMES.get(dept_key, dept_key)
-        if isinstance(result, Exception):
-            logger.error(f"{dept_name} 执行异常：{result}")
-            ministry_results[dept_key] = f"Error: {result}"
-        else:
-            ministry_results[dept_key] = str(result)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(dispatch_map) or 1) as executor:
+        future_map = {
+            executor.submit(execute_ministry, dept_key, task_desc, state, logger): dept_key
+            for dept_key, task_desc in dispatch_map.items()
+        }
+        for future in concurrent.futures.as_completed(future_map):
+            dept_key = future_map[future]
+            dept_name = ROLE_DISPLAY_NAMES.get(dept_key, dept_key)
+            try:
+                ministry_results[dept_key] = future.result()
+            except Exception as exc:
+                logger.error(f"{dept_name} 执行异常：{exc}")
+                ministry_results[dept_key] = f"Error: {exc}"
 
     # 保存结果到文件
+    _validate_task_id(task_id)
     task_dir = TASKS_DIR / task_id
     task_dir.mkdir(parents=True, exist_ok=True)
     for dept_key, result in ministry_results.items():
@@ -714,22 +613,19 @@ def libu_admin_node(state: EdictState) -> EdictState:
     """
     task_id = state["task_id"]
     logger = setup_logger(task_id)
+    validate_flow("shangshu", "libu_admin", logger)
     logger.info("【吏部】开始组织治理")
     log_event_to_db(task_id, "node_start", "libu_admin", "吏部开始治理")
 
     role_prompt = load_role_prompt("libu_admin")
-    context = f"""用户请求：{state['user_input']}
-
-计划：{state['plan']}
-
-当前涉及的部门：{list(state.get('ministry_results', {}).keys())}"""
+    context = (
+        f"用户请求：{state['user_input']}\n\n"
+        f"计划：{state['plan']}\n\n"
+        f"当前涉及的部门：{list(state.get('ministry_results', {}).keys())}"
+    )
 
     try:
-        result = spawn_nanobot_agent.invoke({
-            "role": "libu_admin",
-            "input_context": f"{role_prompt}\n\n---\n## 任务上下文\n{context}",
-            "task_id": task_id
-        })
+        result = call_llm_with_retry(role_prompt, context)
     except Exception as e:
         logger.error(f"吏部执行异常：{e}")
         result = f"Error: {str(e)}"
@@ -751,22 +647,19 @@ def hubu_node(state: EdictState) -> EdictState:
     """
     task_id = state["task_id"]
     logger = setup_logger(task_id)
+    validate_flow("shangshu", "hubu", logger)
     logger.info("【户部】开始资源评估")
     log_event_to_db(task_id, "node_start", "hubu", "户部开始评估")
 
     role_prompt = load_role_prompt("hubu")
-    context = f"""用户请求：{state['user_input']}
-
-计划：{state['plan']}
-
-请评估完成此任务所需的资源、预算和成本。"""
+    context = (
+        f"用户请求：{state['user_input']}\n\n"
+        f"计划：{state['plan']}\n\n"
+        "请评估完成此任务所需的资源、预算和成本。"
+    )
 
     try:
-        result = spawn_nanobot_agent.invoke({
-            "role": "hubu",
-            "input_context": f"{role_prompt}\n\n---\n## 任务上下文\n{context}",
-            "task_id": task_id
-        })
+        result = call_llm_with_retry(role_prompt, context)
     except Exception as e:
         logger.error(f"户部执行异常：{e}")
         result = f"Error: {str(e)}"
@@ -788,25 +681,24 @@ def xingbu_node(state: EdictState) -> EdictState:
     """
     task_id = state["task_id"]
     logger = setup_logger(task_id)
+    validate_flow("shangshu", "xingbu", logger)
     logger.info("【刑部】开始安全审查")
     log_event_to_db(task_id, "node_start", "xingbu", "刑部开始审查")
 
     role_prompt = load_role_prompt("xingbu")
-    context = f"""用户请求：{state['user_input']}
-
-计划：{state['plan']}
-
-各部门执行结果摘要：
-{json.dumps({k: v[:500] for k, v in state.get('ministry_results', {}).items()}, ensure_ascii=False, indent=2)}
-
-请对以上方案和执行结果进行安全与合规审查。"""
+    context = (
+        f"用户请求：{state['user_input']}\n\n"
+        f"计划：{state['plan']}\n\n"
+        "各部门执行结果摘要：\n"
+        + json.dumps(
+            {k: v[:500] for k, v in state.get("ministry_results", {}).items()},
+            ensure_ascii=False, indent=2
+        )
+        + "\n\n请对以上方案和执行结果进行安全与合规审查。"
+    )
 
     try:
-        result = spawn_nanobot_agent.invoke({
-            "role": "xingbu",
-            "input_context": f"{role_prompt}\n\n---\n## 任务上下文\n{context}",
-            "task_id": task_id
-        })
+        result = call_llm_with_retry(role_prompt, context)
     except Exception as e:
         logger.error(f"刑部执行异常：{e}")
         result = f"Error: {str(e)}"
@@ -1110,9 +1002,9 @@ def run_langgraph_workflow(user_input: str, task_id: Optional[str] = None):
 
     config = {"configurable": {"thread_id": task_id}}
 
-    print("\n" + "🐈" * 25)
-    print("nanobot 三省六部制系统 (LangGraph 版本) 启动")
-    print("🐈" * 25)
+    print("\n" + "="*60)
+    print("三省六部制 AI 协作系统 (LangGraph) 启动")
+    print("="*60)
     print(f"任务 ID: {task_id}")
     print(f"用户输入：{user_input}")
     print("\n🚀 开始执行任务...\n")
@@ -1132,9 +1024,9 @@ def run_langgraph_workflow(user_input: str, task_id: Optional[str] = None):
         # 获取最终状态
         final_state = app.get_state(config)
 
-        print("\n" + "🐈" * 25)
+        print("\n" + "="*60)
         print("任务完成!")
-        print("🐈" * 25)
+        print("="*60)
 
         if final_state and final_state.values:
             final_output = final_state.values.get("final_output", "")
@@ -1159,7 +1051,7 @@ def run_langgraph_workflow(user_input: str, task_id: Optional[str] = None):
             print(f"\n结果已保存到：{result_file}")
             logger.info(f"结果已保存到：{result_file}")
 
-            return final_state.value
+            return final_state.values
         else:
             logger.error("最终状态为空")
             return None

@@ -45,10 +45,10 @@ python langgraph_workflow.py "开发一个 Flask API 项目"
 ### 核心特性
 
 1. **驳回重做循环** - 门下省审核不通过自动返回中书省重做
-2. **状态持久化** - 支持断点续跑
-3. **子图嵌套** - 六部作为子图实现
-4. **流式输出** - 实时查看执行进度
-5. **LangSmith 集成** - 可视化监控和调试
+2. **越权防护** - LEGAL_FLOWS + ROLE_CAPABILITIES 在代码层缆执
+3. **尚书省并行调度** - 六部通过 ThreadPoolExecutor 并行执行
+4. **状态持久化** - SQLite + LangGraph Checkpoint
+5. **流式输出** - 实时查看执行进度
 
 ### 架构图
 
@@ -93,7 +93,7 @@ python langgraph_workflow.py "开发一个 Flask API 项目"
 |------|------|---------|
 | **[LANGGRAPH.md](LANGGRAPH.md)** | LangGraph 集成指南 | 开发者 |
 | **[SKILL.md](SKILL.md)** | Skill 定义和使用 | 所有用户 |
-| **[workflow.py](langgraph_workflow.py)** | LangGraph 实现代码 | 开发者 |
+| **[langgraph_workflow.py](langgraph_workflow.py)** | LangGraph 实现代码 | 开发者 |
 
 ### 研究文档
 

@@ -29,18 +29,22 @@
                     ↑封驳 ↓
 ```
 
-### LangGraph 实现
+### LangGraph 实现（`langgraph_workflow.py`）
 
 ```python
 StateGraph(EdictState)
   ├─ Node: zhongshu_node (中书省)
   ├─ Node: menxia_node (门下省)
-  ├─ Node: shangshu_node (尚书省)
-  ├─ SubGraph: libu (礼部)
-  ├─ SubGraph: bingbu (兵部)
-  ├─ SubGraph: gongbu (工部)
+  ├─ Node: shangshu_node (尚书省) ← 通过 ThreadPoolExecutor 并行调度六部 LLM 调用
+  ├─ Node: xingbu_node (刑部，按需触发)
+  ├─ Node: hubu_node (户部，按需触发)
+  ├─ Node: libu_admin_node (吏部，按需触发)
+  ├─ Node: finalize_node (汇总)
   └─ Conditional Edge: menxia → zhongshu (封驳循环)
 ```
+
+> ⚠️ **注意**：六部（礼部/兵部/工部）不作为独立图节点，而是在尚书省内部并行调度。
+> 刑部/户部/吏部作为独立节点，根据关键词条件触发。
 
 ---
 
@@ -149,23 +153,7 @@ def create_edict_workflow():
 
 ## 🔄 驳回重做机制
 
-### 现有 edict 实现（workflow.py 第 776-863 行）
-
-```python
-for round_num in range(1, MAX_REJECTION_ROUNDS + 1):
-    # 中书省规划
-    zhongshu_output = spawn_role_agent(task_id, "zhongshu", ...)
-    
-    # 门下省审核
-    menxia_output = spawn_role_agent(task_id, "menxia", ...)
-    
-    if menxia_result.get("decision") == "封驳":
-        if round_num < MAX_REJECTION_ROUNDS:
-            continue  # 打回重做
-        else:
-            return {"status": "rejected"}
-    break
-```
+### `langgraph_workflow.py` 实现
 
 ### LangGraph 实现
 
@@ -185,25 +173,22 @@ workflow.add_conditional_edges("menxia_node", after_review_route)
 
 ---
 
-## 🗂️ 六部子图嵌套
+## 🗂️ 六部并行执行
+
+六部（礼部/兵部/工部）由尚书省通过 `concurrent.futures.ThreadPoolExecutor` 并行调度，
+每个部门调用 LLM 执行对应角色提示词，结果汇聚到 `ministry_results`。
 
 ```python
-def create_ministry_subgraph(ministry_name: str):
-    """创建六部子图"""
-    ministry_workflow = StateGraph(MinistryState)
-    
-    ministry_workflow.add_node(f"{ministry_name}_work", lambda s: do_work(s))
-    ministry_workflow.add_edge(START, f"{ministry_name}_work")
-    ministry_workflow.add_edge(f"{ministry_name}_work", END)
-    
-    return ministry_workflow.compile()
-
-# 主图
-main_workflow = StateGraph(MainState)
-main_workflow.add_node("lizbu", create_ministry_subgraph("礼部"))
-main_workflow.add_node("bingbu", create_ministry_subgraph("兵部"))
-main_workflow.add_node("gongbu", create_ministry_subgraph("工部"))
+with ThreadPoolExecutor(max_workers=len(dispatch_map)) as executor:
+    future_map = {
+        executor.submit(execute_ministry, dept_key, task_desc, state, logger): dept_key
+        for dept_key, task_desc in dispatch_map.items()
+    }
+    for future in as_completed(future_map):
+        ministry_results[future_map[future]] = future.result()
 ```
+
+> 刑部/户部/吏部作为独立 LangGraph 节点，根据任务关键词条件触发（见 `should_run_governance`）。
 
 ---
 
@@ -277,13 +262,8 @@ for event in app.stream(initial_state):
 
 ### 2. 执行引擎
 
-**现有 edict**: 
-- 三省：`nanobot agent`
-- 兵部/工部：`opencode`
-
-**LangGraph**: 
-- 可继续使用 `nanobot agent`（通过 subprocess）
-- 或集成 `opencode`（通过 tool）
+**LangGraph 版本**：所有节点（三省 + 六部）均通过 LLM（DashScope `qwen-plus`）执行，
+不依赖任何外部工具（已移除 opencode / nanobot）。
 
 ### 3. 错误处理
 
@@ -297,32 +277,10 @@ for event in app.stream(initial_state):
 ### 阶段 1: 并行运行（推荐）
 
 ```
-保留 workflow.py 不变
-↓
-创建 langgraph_workflow.py (POC)
-↓
-对比测试结果
-```
-
-### 阶段 2: 核心替换
-
-```
-用 LangGraph 替换三省流程
-↓
-保留六部现有实现 (opencode/nanobot agent)
-↓
-逐步迁移六部到 LangGraph 子图
-```
-
-### 阶段 3: 完全迁移
-
-```
-移除旧 workflow.py
-↓
-全面使用 LangGraph
-↓
-集成 LangSmith 监控
-```
+已完成迁移，当前状态：
+- 主工作流文件：`langgraph_workflow.py`
+- 所有部门通过 LLM 执行，无外部工具依赖
+- 接下来可集成 LangSmith 监控（见 BACKLOG L4）
 
 ---
 
@@ -341,9 +299,8 @@ for event in app.stream(initial_state):
 
 ## 📖 参考资源
 
-- **POC 代码**: `/workspace/langgraph-edict-poc.py`
-- **快速上手**: `/workspace/langgraph-quickstart.md`
-- **架构图**: `/workspace/langgraph-architecture.md`
+- **工作流代码**: [`langgraph_workflow.py`](langgraph_workflow.py)
+- **已知问题**: [`BACKLOG.md`](BACKLOG.md)
 - **官方文档**: https://docs.langchain.com/oss/python/langgraph/
 - **示例库**: https://github.com/langchain-ai/langgraph/tree/main/examples
 
@@ -351,14 +308,10 @@ for event in app.stream(initial_state):
 
 ## ✅ 下一步行动
 
-1. [ ] 运行 POC 代码验证核心流程
-2. [ ] 集成 opencode 作为兵部/工部执行引擎
-3. [ ] 添加持久化支持（SQLite）
-4. [ ] 集成 LangSmith 监控
-5. [ ] 对比测试现有 edict vs LangGraph 版本
-6. [ ] 编写迁移文档
-
----
-
-
-**作者**: nanobot 🐈
+1. [x] 三省主链运行
+2. [x] 驳回循环
+3. [x] 六部并行执行（ThreadPoolExecutor）
+4. [x] 越权防护（LEGAL_FLOWS + ROLE_CAPABILITIES）
+5. [ ] 集成 LangSmith 监控（见 BACKLOG L4）
+6. [ ] 全局超时（见 BACKLOG M3）
+7. [ ] 门下省对六部结果的二次验收（见 BACKLOG L1）
