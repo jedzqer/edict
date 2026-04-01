@@ -23,7 +23,8 @@ edict-dev/
 │   ├── shangshu.md
 │   └── ...
 ├── tasks/                      # 任务状态目录（运行时自动创建）
-└── history/                    # 历史日志（运行时自动创建）
+├── history/                    # 历史日志（运行时自动创建）
+└── work/                       # 实体工作区（AI通过Tool操作文件存放处）
 ```
 
 ---
@@ -32,22 +33,24 @@ edict-dev/
 
 ```bash
 # 1. 安装依赖
-pip install langgraph langchain langchain-dashscope
+pip install langgraph langchain langchain-openai
 
-# 2. 设置 API Key
+# 2. 设置 API Key (当前默认配置为兼容OpenAI接口的平台，如SiliconFlow)
 export DASHSCOPE_API_KEY="your-api-key"
 
-# 3. 运行工作流
+# 3. 运行工作流 - AI会自动在 work/ 文件夹下生成对应代码
 python langgraph_workflow.py "开发一个 Flask API 项目"
 ```
 
 ### 核心特性
 
 1. **驳回重做循环** - 门下省审核不通过自动返回中书省重做
-2. **越权防护** - LEGAL_FLOWS + ROLE_CAPABILITIES 在代码层缆执
-3. **尚书省并行调度** - 六部通过 ThreadPoolExecutor 并行执行
-4. **状态持久化** - SQLite + LangGraph Checkpoint
-5. **流式输出** - 实时查看执行进度
+2. **纯粹的职责分离** - 中书省专职项目架构设计，门下省把关审核，尚书省专职任务分发与调度
+3. **原生 Tool Calling** - 各部门 AI 可直接操作 `work/` 工作区，兵部直接**写文件**，工部直接**执行指令**
+4. **越权防护** - LEGAL_FLOWS + ROLE_CAPABILITIES 在代码层与提示词层双重验证执行边界
+5. **尚书省并行调度** - 六部通过 ThreadPoolExecutor 并行执行
+6. **状态持久化** - SQLite + LangGraph Checkpoint
+7. **流式输出** - 实时查看执行进度
 
 ### 架构图
 
@@ -125,10 +128,11 @@ result = run_langgraph_workflow("帮我创建 Flask 项目")
 
 | 模块 | 状态 | 备注 |
 |------|------|------|
-| **三省主链** | ✅ 完成 | 中书省→门下省→尚书省 |
+| **三省主链** | ✅ 完成 | 中书省(架构设计)→门下省(审核)→尚书省(派发) |
 | **驳回循环** | ✅ 完成 | 门下省→中书省 |
-| **六部子图** | ✅ 完成 | 全部 6 部实现 |
-| **持久化** | ✅ 完成 | SQLite + Checkpoint |
+| **六部子图** | ✅ 完成 | 兵部(写代码)、工部(部署命令)、刑部(安全策略)等 |
+| **工具挂载** | ✅ 完成 | 原生 Tool 调用: `read_file`, `write_file`, `execute_command` (对应角色解锁权限) |
+| **持久化** | ✅ 完成 | SQLite + Checkpoint + `work/`实体目录资源映射 |
 | **依赖管理** | ✅ 完成 | .venv + requirements.txt |
 
 ---

@@ -27,6 +27,99 @@ from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import MemorySaver
 from langchain_core.messages import HumanMessage, SystemMessage
 
+import subprocess
+from langchain_core.tools import tool
+from langgraph.prebuilt import create_react_agent
+
+WORK_DIR = EDICT_DIR / "work"
+WORK_DIR.mkdir(parents=True, exist_ok=True)
+
+@tool
+def read_file(file_path: str) -> str:
+    """Read a file from the work directory."""
+    try:
+        path = WORK_DIR / file_path
+        if not str(path.resolve()).startswith(str(WORK_DIR.resolve())): return "Error: Access denied."
+        with open(path, 'r', encoding='utf-8') as f:
+            return f.read()
+    except Exception as e:
+        return f"Error reading {file_path}: {e}"
+
+@tool
+def write_file(file_path: str, content: str) -> str:
+    """Write text content to a file in the work directory."""
+    try:
+        path = WORK_DIR / file_path
+        if not str(path.resolve()).startswith(str(WORK_DIR.resolve())): return "Error: Access denied."
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(content)
+        return f"Successfully wrote to {file_path}"
+    except Exception as e:
+        return f"Error writing {file_path}: {e}"
+
+@tool
+def execute_command(command: str) -> str:
+    """Execute a shell command in the work directory."""
+    try:
+        result = subprocess.run(command, shell=True, cwd=WORK_DIR, capture_output=True, text=True, timeout=30)
+        return f"STDOUT:
+{result.stdout}
+STDERR:
+{result.stderr}"
+    except Exception as e:
+        return f"Error executing command: {e}"
+
+def execute_ministry(ministry_key: str, task_desc: str, state: "EdictState", logger: logging.Logger) -> dict:
+    ministry_name = ROLE_DISPLAY_NAMES.get(ministry_key, ministry_key)
+    logger.info(f"  → {ministry_name} 开始执行：{task_desc[:80]}...")
+    try:
+        role_prompt = load_role_prompt(ministry_key)
+        context = (
+            f"用户请求：{state['user_input']}\n\n"
+            f"工作流指定你的任务是：{task_desc}\n\n"
+            f"说明：你可以使用工具在 {WORK_DIR} 目录下读写文件。"
+        )
+        
+        # Select tools based on role
+        tools = [read_file]
+        if ministry_key in ["bingbu", "gongbu", "libu"]:
+            tools.append(write_file)
+        if ministry_key == "gongbu":
+            tools.append(execute_command)
+            
+        llm = _get_llm_for_role(ministry_key)
+        
+        try:
+            # LangGraph v1.0 syntax
+            agent = create_react_agent(llm, tools=tools, state_modifier=role_prompt)
+        except Exception:
+            # LangChain older fallback
+            from langchain.agents import create_tool_calling_agent, AgentExecutor
+            from langchain_core.prompts import ChatPromptTemplate
+            prompt = ChatPromptTemplate.from_messages([
+                ("system", role_prompt),
+                ("placeholder", "{chat_history}"),
+                ("human", "{input}"),
+                ("placeholder", "{agent_scratchpad}"),
+            ])
+            agent = create_tool_calling_agent(llm, tools, prompt)
+            agent = AgentExecutor(agent=agent, tools=tools)
+
+        try:
+            res = agent.invoke({"messages": [("user", context)]})
+            output = res["messages"][-1].content
+        except:
+            res = agent.invoke({"input": context})
+            output = res["output"]
+
+        logger.info(f"  ← {ministry_name} 执行完成")
+        return {"output": output, "status": "success", "timestamp": datetime.now().isoformat()}
+    except Exception as e:
+        logger.error(f"  ← {ministry_name} 执行异常：{e}")
+        return {"output": str(e), "status": "error", "timestamp": datetime.now().isoformat()}
+
+
 # 路径配置
 EDICT_DIR = Path(__file__).parent
 TASKS_DIR = EDICT_DIR / "tasks"
@@ -409,28 +502,7 @@ def load_role_prompt(role: str) -> str:
     return role_file.read_text(encoding="utf-8")
 
 
-def execute_ministry(ministry_key: str, task_desc: str,
-                     state: "EdictState", logger: logging.Logger) -> Dict[str, Any]:
-    """通过 LLM 执行单个部门任务，返回结构化结果（L2）"""
-    ministry_name = ROLE_DISPLAY_NAMES.get(ministry_key, ministry_key)
-    logger.info(f"  → {ministry_name} 开始执行：{task_desc[:80]}...")
-    try:
-        role_prompt = load_role_prompt(ministry_key)
-        context = (
-            f"用户请求：{state['user_input']}\n\n"
-            f"计划：{state['plan']}\n\n"
-            f"派发任务：{task_desc}"
-        )
-        output = call_llm_with_retry(role_prompt, context, role=ministry_key)
-        logger.info(f"  ← {ministry_name} 执行完成")
-        return {"output": output, "status": "success", "timestamp": datetime.now().isoformat()}
-    except EdictExecutionError as e:
-        logger.error(f"  ← {ministry_name} 执行失败：{e}")
-        return {"output": str(e), "status": "error", "timestamp": datetime.now().isoformat()}
-    except Exception as e:
-        logger.error(f"  ← {ministry_name} 执行异常：{e}")
-        return {"output": str(e), "status": "error", "timestamp": datetime.now().isoformat()}
-
+# execute_ministry moved above
 
 # ==================== 节点实现 ====================
 
@@ -452,28 +524,24 @@ def zhongshu_node(state: EdictState) -> EdictState:
 {state['review_feedback']}
 """
 
-    system_prompt = """你是中书省令，负责规划任务。
-请根据用户输入，生成详细的执行计划。
+    system_prompt = """你是中书省令，负责项目结构设计。
+请根据用户输入，生成项目的详细结构设计和实施步骤，不需要分配部门，部门分配将由尚书省完成。
 
 计划必须使用以下 JSON 格式输出：
 ```json
 {
     "task_name": "任务名称",
     "description": "任务描述",
-    "ministries": [
-        {"name": "礼部", "task": "负责的具体工作"},
-        {"name": "兵部", "task": "负责的具体工作"},
-        {"name": "工部", "task": "负责的具体工作"}
+    "project_structure": "项目的整体架构和目录结构设计",
+    "implementation_steps": [
+        "步骤1：...",
+        "步骤2：...",
+        "步骤3：..."
     ],
     "timeline": "预期时间线",
     "resources": "所需资源"
 }
-```
-
-可用部门：户部（资源预算）、礼部（文档写作）、
-兵部（代码实现）、刑部（安全审查）、工部（部署构建）
-
-请根据任务需要合理分配部门，不要遗漏必要的部门。"""
+```"""
 
     user_content = f"用户任务：{state['user_input']}{revision_hint}"
 
@@ -499,13 +567,13 @@ def menxia_node(state: EdictState) -> EdictState:
     logger.info("【门下省】开始审核计划")
     log_event_to_db(task_id, "node_start", "menxia", "门下省开始审核")
 
-    system_prompt = f"""你是门下省侍中，负责审核中书省的计划。
+    system_prompt = f"""你是门下省侍中，负责审核中书省的项目结构设计计划。
 
 审核标准：
 1. 可行性：计划是否可执行
 2. 资源充足性：资源是否足够
 3. 风险控制：是否有风险预案
-4. 部门分工：六部职责是否明确
+4. 结构设计：项目的实施步骤和整体架构是否合理清晰
 
 当前是第 {state.get("revision_count", 0)} 次修订，最大允许 {MAX_REVISIONS} 次。
 
@@ -618,36 +686,32 @@ def shangshu_node(state: EdictState) -> EdictState:
     logger.info("【尚书省】开始协调六部执行")
     log_event_to_db(task_id, "node_start", "shangshu", "尚书省开始协调")
 
-    # 解析中书省计划中的 JSON
-    plan_json = extract_json_from_output(state["plan"])
-
-    if plan_json and "ministries" in plan_json:
-        ministries = plan_json["ministries"]
-        logger.info(f"从计划中解析到 {len(ministries)} 个部门任务")
-    else:
-        # 回退：让尚书省重新派发
-        system_prompt = """你是尚书省尚书令，负责协调六部执行任务。
-
-请根据以下计划和审核意见，分派任务给六部。
+    # 中书省现在只规划项目结构，具体部门分配由尚书省进行
+    system_prompt = """你是尚书省尚书令，负责协调派发六部执行任务。
+请根据以下计划（包含项目结构设计与实施步骤）和门下省的审核意见，把任务合理分派给六部。
 输出必须是 JSON 格式：
 ```json
 {
     "dispatch_log": [
-        {"department": "兵部", "task": "具体任务描述"},
-        {"department": "工部", "task": "具体任务描述"}
+        {"name": "兵部", "task": "具体负责的代码开发任务描述"},
+        {"name": "工部", "task": "具体负责的部署与基础设施构建描述"},
+        {"name": "礼部", "task": "文案与文档相关描述"},
+        {"name": "刑部", "task": "安全合规审查相关描述"},
+        {"name": "户部", "task": "成本与资源配置相关描述"}
     ]
 }
 ```
+可用部门：吏部、户部、礼部、兵部、刑部、工部
 
-可用部门：吏部、户部、礼部、兵部、刑部、工部"""
+特别注意权限边界：所有涉及代码编写和逻辑实现的工作必须分配给【兵部】，部署工作分配给【工部】。"""
 
-        user_content = f"""计划：{state['plan']}
-审核意见：{state['review_feedback']}
-用户任务：{state['user_input']}"""
+    user_content = f"计划：\n{state['plan']}\n\n审核意见：\n{state['review_feedback']}\n\n用户任务：\n{state['user_input']}"
 
-        dispatch_result = call_llm_with_retry(system_prompt, user_content, role="shangshu")
-        plan_json = extract_json_from_output(dispatch_result)
-        ministries = plan_json.get("dispatch_log", []) if plan_json else []
+    dispatch_result = call_llm_with_retry(system_prompt, user_content, role="shangshu")
+    logger.info(f"尚书省分配完成：{dispatch_result[:200]}...")
+
+    plan_json = extract_json_from_output(dispatch_result)
+    ministries = plan_json.get("dispatch_log", []) if plan_json else []
 
     # 如果没有解析到任何部门，使用默认
     if not ministries:
