@@ -87,15 +87,21 @@ if not global_logger.handlers:
 
 # ==================== 配置 ====================
 
+_DASHSCOPE_API_KEY = os.getenv("DASHSCOPE_API_KEY")
+if not _DASHSCOPE_API_KEY:
+    raise EnvironmentError(
+        "DASHSCOPE_API_KEY 环境变量未设置，请执行：export DASHSCOPE_API_KEY=\"your-api-key\""
+    )
+
 try:
     from langchain_dashscope import ChatDashScope
     llm = ChatDashScope(
         model="qwen-plus",
-        dashscope_api_key=os.getenv("DASHSCOPE_API_KEY", "your-api-key")
+        dashscope_api_key=_DASHSCOPE_API_KEY
     )
 except Exception as e:
     print(f"⚠️  DashScope 初始化失败：{e}")
-    print("请使用备用 LLM 或设置 DASHSCOPE_API_KEY 环境变量")
+    print("请检查 DASHSCOPE_API_KEY 是否有效")
     llm = None
 
 BINGBU_USE_OPENCODE = True
@@ -252,6 +258,7 @@ class EdictState(TypedDict):
     final_output: str
     created_at: str
     updated_at: str
+    status: str
 
 
 class MinistryState(TypedDict):
@@ -293,9 +300,18 @@ def run_opencode_task(task_description: str, project_dir: Optional[str] = None) 
         return f"Error: {str(e)}"
 
 
+def _validate_task_id(task_id: str) -> str:
+    """校验 task_id 只允许安全字符，防止路径遍历"""
+    import re as _re
+    if not _re.match(r'^[a-zA-Z0-9_\-\.]+$', task_id):
+        raise ValueError(f"非法 task_id：{task_id!r}")
+    return task_id
+
+
 @tool
 def spawn_nanobot_agent(role: str, input_context: str, task_id: str) -> str:
     """调用 nanobot agent 执行角色任务"""
+    _validate_task_id(task_id)
     task_dir = TASKS_DIR / task_id
     task_dir.mkdir(parents=True, exist_ok=True)
     output_file = task_dir / f"{role}.output"
@@ -655,7 +671,17 @@ def shangshu_node(state: EdictState) -> EdictState:
             )
         return await asyncio.gather(*tasks, return_exceptions=True)
 
-    results = asyncio.run(run_all_ministries())
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+
+    if loop and loop.is_running():
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            results = pool.submit(asyncio.run, run_all_ministries()).result()
+    else:
+        results = asyncio.run(run_all_ministries())
 
     for (dept_key, _), result in zip(dispatch_map.items(), results):
         dept_name = ROLE_DISPLAY_NAMES.get(dept_key, dept_key)
@@ -789,164 +815,6 @@ def xingbu_node(state: EdictState) -> EdictState:
     ministry_results["xingbu"] = result
 
     log_event_to_db(task_id, "node_complete", "xingbu", "刑部审查完成")
-    return {
-        "ministry_results": ministry_results,
-        "updated_at": datetime.now().isoformat()
-    }
-
-
-def liubu_node(state: EdictState) -> EdictState:
-    """礼部执行节点：文档写作、翻译润色"""
-    task_id = state["task_id"]
-    logger = setup_logger(task_id)
-    logger.info("【礼部】开始文事执行")
-    log_event_to_db(task_id, "node_start", "libu", "礼部开始执行")
-
-    role_prompt = load_role_prompt("libu")
-    plan_json = extract_json_from_output(state["plan"])
-
-    task_desc = "负责文事、文档编写、翻译润色工作"
-    if plan_json and "ministries" in plan_json:
-        for m in plan_json["ministries"]:
-            if m.get("name") == "礼部":
-                task_desc = m.get("task", task_desc)
-                break
-
-    context = f"""用户请求：{state['user_input']}
-
-计划：{state['plan']}
-
-派发任务：{task_desc}"""
-
-    try:
-        result = spawn_nanobot_agent.invoke({
-            "role": "libu",
-            "input_context": f"{role_prompt}\n\n---\n## 任务上下文\n{context}",
-            "task_id": task_id
-        })
-    except Exception as e:
-        logger.error(f"礼部执行异常：{e}")
-        result = f"Error: {str(e)}"
-
-    ministry_results = dict(state.get("ministry_results", {}))
-    ministry_results["libu"] = result
-
-    log_event_to_db(task_id, "node_complete", "libu", "礼部执行完成")
-    return {
-        "ministry_results": ministry_results,
-        "updated_at": datetime.now().isoformat()
-    }
-
-
-def bingbu_node(state: EdictState) -> EdictState:
-    """兵部执行节点：代码实现、技术调试（使用 opencode）"""
-    task_id = state["task_id"]
-    logger = setup_logger(task_id)
-    logger.info("【兵部】开始技术执行")
-    log_event_to_db(task_id, "node_start", "bingbu", "兵部开始执行")
-
-    role_prompt = load_role_prompt("bingbu")
-    plan_json = extract_json_from_output(state["plan"])
-
-    task_desc = "负责代码开发、技术实现"
-    if plan_json and "ministries" in plan_json:
-        for m in plan_json["ministries"]:
-            if m.get("name") == "兵部":
-                task_desc = m.get("task", task_desc)
-                break
-
-    full_task = f"""{role_prompt}
-
----
-## 代码开发任务
-
-用户请求：{state['user_input']}
-
-派发任务：{task_desc}
-
-计划详情：{state['plan']}
-
-⚠️ 重要要求：
-1. 根据任务描述进行代码开发、调试或技术实现
-2. 可以使用新建文件或修改现有文件
-3. 修改后必须保存文件
-4. 在输出中明确列出修改/创建的文件
-
-🚨 错误报告要求：
-1. 遇到任何错误必须立即停止并报告
-2. 禁止跳过步骤或静默失败
-3. 在输出中明确说明遇到的问题和错误信息"""
-
-    try:
-        result = run_opencode_task.invoke({
-            "task_description": full_task,
-            "project_dir": None
-        })
-    except Exception as e:
-        logger.error(f"兵部执行异常：{e}")
-        result = f"Error: {str(e)}"
-
-    ministry_results = dict(state.get("ministry_results", {}))
-    ministry_results["bingbu"] = result
-
-    log_event_to_db(task_id, "node_complete", "bingbu", "兵部执行完成")
-    return {
-        "ministry_results": ministry_results,
-        "updated_at": datetime.now().isoformat()
-    }
-
-
-def gongbu_node(state: EdictState) -> EdictState:
-    """工部执行节点：部署构建、运维发布（使用 opencode）"""
-    task_id = state["task_id"]
-    logger = setup_logger(task_id)
-    logger.info("【工部】开始工事执行")
-    log_event_to_db(task_id, "node_start", "gongbu", "工部开始执行")
-
-    role_prompt = load_role_prompt("gongbu")
-    plan_json = extract_json_from_output(state["plan"])
-
-    task_desc = "负责部署构建、运维发布"
-    if plan_json and "ministries" in plan_json:
-        for m in plan_json["ministries"]:
-            if m.get("name") == "工部":
-                task_desc = m.get("task", task_desc)
-                break
-
-    full_task = f"""{role_prompt}
-
----
-## 项目部署运维任务
-
-用户请求：{state['user_input']}
-
-派发任务：{task_desc}
-
-计划详情：{state['plan']}
-
-⚠️ 重要要求：
-1. 执行实际的部署/构建/运维操作
-2. 在输出中明确部署步骤和结果
-3. 验证部署是否成功
-
-🚨 错误报告要求：
-1. 遇到任何错误必须立即停止并报告
-2. 禁止跳过步骤或静默失败
-3. 提供回滚方案"""
-
-    try:
-        result = run_opencode_task.invoke({
-            "task_description": full_task,
-            "project_dir": None
-        })
-    except Exception as e:
-        logger.error(f"工部执行异常：{e}")
-        result = f"Error: {str(e)}"
-
-    ministry_results = dict(state.get("ministry_results", {}))
-    ministry_results["gongbu"] = result
-
-    log_event_to_db(task_id, "node_complete", "gongbu", "工部执行完成")
     return {
         "ministry_results": ministry_results,
         "updated_at": datetime.now().isoformat()
@@ -1090,21 +958,30 @@ def should_run_governance(state: EdictState) -> Literal["libu_admin_node", "hubu
 
 def after_governance_route(state: EdictState) -> Literal["libu_admin_node", "hubu_node", "xingbu_node", "finalize_node"]:
     """治理节点后的路由，检查是否还有其他治理节点需要执行"""
-    combined_text = f"{state['user_input']}\n{state['plan']}"
+    combined_text = f"{state['user_input']}\n{state['plan']}\n{state.get('review_feedback', '')}"
     results = state.get("ministry_results", {})
 
     xingbu_keywords = [
         "生产", "prod", "权限", "敏感", "密码", "密钥", "token",
-        "删除", "drop", "安全", "合规", "审计", "上线", "发布"
+        "删除", "drop", "truncate", "rm -rf", "sudo", "root",
+        "安全", "合规", "审计", "越权", "注入", "泄露", "高风险",
+        "上线", "发布", "配置替换", "数据库迁移"
     ]
     if "xingbu" not in results and any(kw in combined_text for kw in xingbu_keywords):
         return "xingbu_node"
 
-    hubu_keywords = ["预算", "成本", "配额", "资源", "费用", "经济"]
+    hubu_keywords = [
+        "预算", "成本", "配额", "资源", "限量", "多模型",
+        "费用", "token 限制", "调用次数", "配额不足", "经济",
+        "优化成本", "资源评估"
+    ]
     if "hubu" not in results and any(kw in combined_text for kw in hubu_keywords):
         return "hubu_node"
 
-    libu_admin_keywords = ["角色变更", "能力登记", "部门调整", "治理", "组织架构"]
+    libu_admin_keywords = [
+        "角色变更", "能力登记", "部门调整", "名册", "替补",
+        "路由", "可用性", "治理", "组织架构"
+    ]
     if "libu_admin" not in results and any(kw in combined_text for kw in libu_admin_keywords):
         return "libu_admin_node"
 
@@ -1259,8 +1136,8 @@ def run_langgraph_workflow(user_input: str, task_id: Optional[str] = None):
         print("任务完成!")
         print("🐈" * 25)
 
-        if final_state and final_state.value:
-            final_output = final_state.value.get("final_output", "")
+        if final_state and final_state.values:
+            final_output = final_state.values.get("final_output", "")
             print(f"\n最终输出:\n{final_output[:1000]}...")
 
             # 保存结果
@@ -1269,13 +1146,14 @@ def run_langgraph_workflow(user_input: str, task_id: Optional[str] = None):
 
             result_file = task_dir / "result_langgraph.json"
             result_file.write_text(
-                json.dumps(final_state.value, indent=2, ensure_ascii=False),
+                json.dumps(final_state.values, indent=2, ensure_ascii=False),
                 encoding="utf-8"
             )
 
             # 更新数据库状态
-            final_state.value["status"] = "completed"
-            save_state_to_db(final_state.value)
+            completed_state = dict(final_state.values)
+            completed_state["status"] = "completed"
+            save_state_to_db(completed_state)
             log_event_to_db(task_id, "workflow_complete", None, "工作流执行完成")
 
             print(f"\n结果已保存到：{result_file}")
