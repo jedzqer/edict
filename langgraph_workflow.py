@@ -1019,12 +1019,12 @@ def finalize_node(state: EdictState) -> EdictState:
 
 # ==================== 路由逻辑 ====================
 
-def after_review_route(state: EdictState) -> Literal["zhongshu_node", "shangshu_node", "libu_admin_node", "hubu_node", "xingbu_node", "liubu_node", "bingbu_node", "gongbu_node", END]:
+def after_review_route(state: EdictState) -> Literal["zhongshu_node", "shangshu_node", END]:
     """
     门下省审核后的路由决策
 
     - 如果驳回：返回中书省重做（循环）
-    - 如果通过：前往六部执行（并行）
+    - 如果通过：前往尚书省内部并行执行六部
     - 如果超过最大重试次数：结束
     """
     task_id = state.get("task_id", "unknown")
@@ -1117,19 +1117,16 @@ def create_edict_workflow():
     """创建三省六部制工作流图"""
     workflow = StateGraph(EdictState)
 
-    # 添加节点
+    # 添加节点（礼部/兵部/工部由尚书省内部并行调度，不作为独立图节点）
     workflow.add_node("zhongshu_node", zhongshu_node)
     workflow.add_node("menxia_node", menxia_node)
     workflow.add_node("shangshu_node", shangshu_node)
     workflow.add_node("libu_admin_node", libu_admin_node)
     workflow.add_node("hubu_node", hubu_node)
-    workflow.add_node("liubu_node", liubu_node)
-    workflow.add_node("bingbu_node", bingbu_node)
     workflow.add_node("xingbu_node", xingbu_node)
-    workflow.add_node("gongbu_node", gongbu_node)
     workflow.add_node("finalize_node", finalize_node)
 
-    # 添加边
+    # 主链
     workflow.add_edge(START, "zhongshu_node")
     workflow.add_edge("zhongshu_node", "menxia_node")
 
@@ -1144,20 +1141,46 @@ def create_edict_workflow():
         }
     )
 
-    # 尚书省 → 六部并行
-    workflow.add_edge("shangshu_node", "liubu_node")
-    workflow.add_edge("shangshu_node", "bingbu_node")
-    workflow.add_edge("shangshu_node", "gongbu_node")
+    # 尚书省执行完毕 → 条件治理路由
+    workflow.add_conditional_edges(
+        "shangshu_node",
+        should_run_governance,
+        {
+            "xingbu_node": "xingbu_node",
+            "hubu_node": "hubu_node",
+            "libu_admin_node": "libu_admin_node",
+            "finalize_node": "finalize_node",
+        }
+    )
 
-    # 六部 → 条件治理
-    workflow.add_edge("liubu_node", "xingbu_node")
-    workflow.add_edge("bingbu_node", "xingbu_node")
-    workflow.add_edge("gongbu_node", "xingbu_node")
-
-    # 治理节点 → 汇总
-    workflow.add_edge("xingbu_node", "finalize_node")
-    workflow.add_edge("libu_admin_node", "finalize_node")
-    workflow.add_edge("hubu_node", "finalize_node")
+    # 治理节点链式路由（每个节点执行完后检查是否还需其他治理节点）
+    workflow.add_conditional_edges(
+        "xingbu_node",
+        after_governance_route,
+        {
+            "hubu_node": "hubu_node",
+            "libu_admin_node": "libu_admin_node",
+            "finalize_node": "finalize_node",
+        }
+    )
+    workflow.add_conditional_edges(
+        "hubu_node",
+        after_governance_route,
+        {
+            "xingbu_node": "xingbu_node",
+            "libu_admin_node": "libu_admin_node",
+            "finalize_node": "finalize_node",
+        }
+    )
+    workflow.add_conditional_edges(
+        "libu_admin_node",
+        after_governance_route,
+        {
+            "xingbu_node": "xingbu_node",
+            "hubu_node": "hubu_node",
+            "finalize_node": "finalize_node",
+        }
+    )
 
     workflow.add_edge("finalize_node", END)
 
@@ -1224,8 +1247,10 @@ def run_langgraph_workflow(user_input: str, task_id: Optional[str] = None):
                 print(f"\n[节点完成] {display_name}")
                 logger.info(f"节点完成：{display_name}")
 
-                # 每次节点更新后保存状态到 DB
-                save_state_to_db(output)
+        # 流式执行完毕后获取完整状态并保存
+        final_state_snapshot = app.get_state(config)
+        if final_state_snapshot and final_state_snapshot.values:
+            save_state_to_db(final_state_snapshot.values)
 
         # 获取最终状态
         final_state = app.get_state(config)
