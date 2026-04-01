@@ -152,4 +152,5 @@ result = run_langgraph_workflow("帮我创建 Flask 项目")
 - **edict 主分支**: `<workspace>/skills/edict/`
 
 ## 下一步开发
+- 添加一个“公堂”，每个agent都可以发言，将会同时发送给所有agent，用于开会讨论（记得写入各角色提示词）
 - Web可视化监控

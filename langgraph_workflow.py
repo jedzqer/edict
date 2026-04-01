@@ -782,80 +782,122 @@ def _plan_governance_with_llm(state: "EdictState",
 def shangshu_node(state: EdictState) -> EdictState:
     """
     尚书省：协调派发
-    解析中书省计划 JSON，智能分配六部任务，并行执行，汇总结果
+    由 LLM 决定调用哪些部门、分几个阶段执行，阶段间串行（后阶段可看到前阶段输出），
+    同一阶段内并行。
     """
     task_id = state["task_id"]
     logger = setup_logger(task_id)
     logger.info("【尚书省】开始协调六部执行")
     log_event_to_db(task_id, "node_start", "shangshu", "尚书省开始协调")
 
-    # 中书省现在只规划项目结构，具体部门分配由尚书省进行
-    system_prompt = """你是尚书省尚书令，负责协调派发六部执行任务。
-请根据以下计划（包含项目结构设计与实施步骤）和门下省的审核意见，把任务合理分派给六部。
+    system_prompt = """你是尚书省尚书令，负责协调六部执行任务。
+
+根据计划内容，决定：
+1. 需要调用哪些部门（只调用确实需要的部门，不必所有部门都派活）
+2. 各部门的执行顺序：有依赖关系的放入不同阶段（stage），同一阶段内并行执行
+
+执行规则：
+- 若某部门的输出会影响另一个部门的工作（如户部的资源建议要传递给兵部），则户部放早期阶段，兵部放后续阶段
+- 兵部专门负责代码编写，工部负责部署，礼部负责文案——不要让它们互相越权
+- 若任务不涉及某部门，直接不分配，不要编造无意义的任务
+
+可用部门：吏部(libu_admin)、户部(hubu)、礼部(libu)、兵部(bingbu)、刑部(xingbu)、工部(gongbu)
+
 输出必须是 JSON 格式：
 ```json
 {
-    "dispatch_log": [
-        {"name": "兵部", "task": "具体负责的代码开发任务描述"},
-        {"name": "工部", "task": "具体负责的部署与基础设施构建描述"},
-        {"name": "礼部", "task": "文案与文档相关描述"},
-        {"name": "刑部", "task": "安全合规审查相关描述"},
-        {"name": "户部", "task": "成本与资源配置相关描述"}
+    "stages": [
+        {
+            "stage": 1,
+            "description": "第一阶段概述（如：资源评估）",
+            "departments": [
+                {"name": "户部", "task": "评估本项目所需云资源和成本，重点说明数据库和服务器选型建议"}
+            ]
+        },
+        {
+            "stage": 2,
+            "description": "第二阶段概述（如：代码开发，依赖第一阶段的资源建议）",
+            "departments": [
+                {"name": "兵部", "task": "根据户部的资源建议，实现xxx功能……"},
+                {"name": "礼部", "task": "编写用户文档"}
+            ]
+        }
     ]
 }
-```
-可用部门：吏部、户部、礼部、兵部、刑部、工部
+```"""
 
-特别注意权限边界：所有涉及代码编写和逻辑实现的工作必须分配给【兵部】，部署工作分配给【工部】。"""
-
-    user_content = f"计划：\n{state['plan']}\n\n审核意见：\n{state['review_feedback']}\n\n用户任务：\n{state['user_input']}"
+    user_content = (
+        f"用户任务：\n{state['user_input']}\n\n"
+        f"中书省计划：\n{state['plan']}\n\n"
+        f"门下省审核意见：\n{state['review_feedback']}"
+    )
 
     dispatch_result = call_llm_with_retry(system_prompt, user_content, role="shangshu")
-    logger.info(f"尚书省分配完成：{dispatch_result[:200]}...")
+    logger.info(f"尚书省分配方案：{dispatch_result[:200]}...")
 
     plan_json = extract_json_from_output(dispatch_result)
-    ministries = plan_json.get("dispatch_log", []) if plan_json else []
+    stages = plan_json.get("stages", []) if plan_json else []
 
-    # 如果没有解析到任何部门，使用默认
-    if not ministries:
-        logger.warning("未解析到任何部门任务，使用默认兵部任务")
-        ministries = [{"name": "兵部", "task": state["user_input"]}]
+    # 回退：若解析失败则单阶段执行兵部
+    if not stages:
+        logger.warning("未解析到分阶段方案，回退到单阶段兵部任务")
+        stages = [{"stage": 1, "description": "默认执行", "departments": [{"name": "兵部", "task": state["user_input"]}]}]
 
-    # 构建派发映射，并检查每个派发是否合法流转
-    dispatch_map = {}
-    for m in ministries:
-        dept_name = m.get("name", "")
-        dept_key = normalize_department(dept_name)
-        if dept_key:
-            if validate_flow("shangshu", dept_key, logger):
-                dispatch_map[dept_key] = m.get("task", "")
-            else:
-                logger.warning(f"跳过非法派发目标：{dept_name}")
-
-    logger.info(f"派发任务到 {len(dispatch_map)} 个部门：{list(dispatch_map.keys())}")
-
-    # 并行执行六部任务（ThreadPoolExecutor，避免 asyncio 死锁）
     ministry_results: Dict[str, Dict[str, Any]] = dict(state.get("ministry_results", {}))
     _validate_task_id(task_id)
     task_dir = TASKS_DIR / task_id
     task_dir.mkdir(parents=True, exist_ok=True)
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=len(dispatch_map) or 1) as executor:
-        future_map = {
-            executor.submit(execute_ministry, dept_key, task_desc, state, logger, task_dir): dept_key
-            for dept_key, task_desc in dispatch_map.items()
-        }
-        for future in concurrent.futures.as_completed(future_map):
-            dept_key = future_map[future]
-            dept_name = ROLE_DISPLAY_NAMES.get(dept_key, dept_key)
-            try:
-                ministry_results[dept_key] = future.result()
-            except Exception as exc:
-                logger.error(f"{dept_name} 执行异常：{exc}")
-                ministry_results[dept_key] = {
-                    "output": str(exc), "status": "error",
-                    "timestamp": datetime.now().isoformat()
-                }
+    # 按阶段串行，阶段内并行
+    for stage_info in sorted(stages, key=lambda s: s.get("stage", 0)):
+        stage_num = stage_info.get("stage", "?")
+        stage_desc = stage_info.get("description", "")
+        departments = stage_info.get("departments", [])
+
+        # 将前序阶段产出注入到本阶段每个部门的任务描述末尾
+        prior_outputs = ""
+        if ministry_results:
+            prior_outputs = "\n\n【前序部门产出（供参考）】\n" + "\n".join(
+                f"- {ROLE_DISPLAY_NAMES.get(k, k)}：{v.get('output', '')[:600]}"
+                for k, v in ministry_results.items()
+            )
+
+        # 构建本阶段派发映射
+        stage_dispatch: Dict[str, str] = {}
+        for m in departments:
+            dept_name = m.get("name", "")
+            dept_key = normalize_department(dept_name)
+            if not dept_key:
+                logger.warning(f"未知部门名：{dept_name}，跳过")
+                continue
+            if not validate_flow("shangshu", dept_key, logger):
+                continue
+            task_desc = m.get("task", "") + prior_outputs
+            stage_dispatch[dept_key] = task_desc
+
+        if not stage_dispatch:
+            logger.warning(f"阶段 {stage_num} 无有效部门，跳过")
+            continue
+
+        logger.info(f"阶段 {stage_num}（{stage_desc}）：并行执行 {list(stage_dispatch.keys())}")
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(stage_dispatch)) as executor:
+            future_map = {
+                executor.submit(execute_ministry, dept_key, task_desc, state, logger, task_dir): dept_key
+                for dept_key, task_desc in stage_dispatch.items()
+            }
+            for future in concurrent.futures.as_completed(future_map):
+                dept_key = future_map[future]
+                dept_name = ROLE_DISPLAY_NAMES.get(dept_key, dept_key)
+                try:
+                    ministry_results[dept_key] = future.result()
+                    logger.info(f"  ✓ {dept_name} 完成（阶段 {stage_num}）")
+                except Exception as exc:
+                    logger.error(f"  ✗ {dept_name} 执行异常：{exc}")
+                    ministry_results[dept_key] = {
+                        "output": str(exc), "status": "error",
+                        "timestamp": datetime.now().isoformat()
+                    }
 
     # M1: 用 LLM 语义分析决定需要哪些治理部门
     governance_plan = _plan_governance_with_llm(state, ministry_results, logger)
