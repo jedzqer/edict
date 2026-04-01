@@ -151,3 +151,5 @@ result = run_langgraph_workflow("帮我创建 Flask 项目")
 - **LangSmith 监控**: https://smith.langchain.com/
 - **edict 主分支**: `<workspace>/skills/edict/`
 
+## 下一步开发
+- Web可视化监控

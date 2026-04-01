@@ -27,6 +27,7 @@ history/
 *.db
 *.db-shm
 *.db-wal
+work/
 
 # API Configuration (contains sensitive keys)
 models.json

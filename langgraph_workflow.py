@@ -30,7 +30,6 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 import subprocess
 from langchain_core.tools import tool
-from langgraph.prebuilt import create_react_agent
 
 
 @tool
@@ -90,21 +89,8 @@ def execute_ministry(ministry_key: str, task_desc: str, state: "EdictState",
 
         llm = _get_llm_for_role(ministry_key)
 
-        try:
-            # LangGraph v1.0 syntax
-            agent = create_react_agent(llm, tools=tools, state_modifier=role_prompt)
-        except Exception:
-            # LangChain older fallback
-            from langchain.agents import create_tool_calling_agent, AgentExecutor
-            from langchain_core.prompts import ChatPromptTemplate
-            prompt = ChatPromptTemplate.from_messages([
-                ("system", role_prompt),
-                ("placeholder", "{chat_history}"),
-                ("human", "{input}"),
-                ("placeholder", "{agent_scratchpad}"),
-            ])
-            agent_chain = create_tool_calling_agent(llm, tools, prompt)
-            agent = AgentExecutor(agent=agent_chain, tools=tools)
+        from langchain.agents import create_agent
+        agent = create_agent(llm, tools=tools, system_prompt=role_prompt)
 
         def _stream_to_file(agent_obj) -> str:
             """流式执行并实时写入输出文件，返回最终输出文本"""
@@ -279,12 +265,6 @@ def write_node_output(task_id: str, filename: str, content: str) -> None:
 
 
 # ==================== 配置 ====================
-
-_DASHSCOPE_API_KEY = os.getenv("DASHSCOPE_API_KEY")
-if not _DASHSCOPE_API_KEY:
-    raise EnvironmentError(
-        "DASHSCOPE_API_KEY 环境变量未设置，请执行：export DASHSCOPE_API_KEY=\"your-api-key\""
-    )
 
 # LangSmith 集成（L4）：检测到 LANGCHAIN_API_KEY 时自动启用 tracing
 if os.getenv("LANGCHAIN_API_KEY"):
