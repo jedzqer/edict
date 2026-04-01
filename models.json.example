@@ -1,0 +1,57 @@
+{
+  "models": {
+    "zhongshu": {
+      "provider": "your-provider",
+      "endpoint": "https://api.example.com/v1",
+      "model": "your-model-name",
+      "api_key": "sk-your-api-key-here",
+      "description": "中书省 - 规划诏令",
+      "temperature": 0.7
+    },
+    "menxia": {
+      "provider": "your-provider",
+      "endpoint": "https://api.example.com/v1",
+      "model": "your-model-name",
+      "api_key": "sk-your-api-key-here",
+      "description": "门下省 - 审核封驳",
+      "temperature": 0.3
+    },
+    "shangshu": {
+      "provider": "dashscope",
+      "endpoint": "https://dashscope.aliyuncs.com/api/v1",
+      "model": "qwen3.5-plus",
+      "api_key": "sk-your-dashscope-api-key",
+      "description": "尚书省 - 执行协调",
+      "temperature": 0.5
+    },
+    "bingbu": {
+      "provider": "dashscope",
+      "endpoint": "https://dashscope.aliyuncs.com/api/v1",
+      "model": "qwen3.5-plus",
+      "api_key": "sk-your-dashscope-api-key",
+      "description": "兵部 - 代码开发 (opencode)",
+      "temperature": 0.3
+    },
+    "libu": {
+      "provider": "your-provider",
+      "endpoint": "https://api.example.com/v1",
+      "model": "your-model-name",
+      "api_key": "sk-your-api-key-here",
+      "description": "礼部 - 文档/写作",
+      "temperature": 0.7
+    },
+    "gongbu": {
+      "provider": "dashscope",
+      "endpoint": "https://dashscope.aliyuncs.com/api/v1",
+      "model": "qwen3.5-plus",
+      "api_key": "sk-your-dashscope-api-key",
+      "description": "工部 - 部署/运维",
+      "temperature": 0.5
+    }
+  },
+  "default_model": {
+    "provider": "dashscope",
+    "model": "qwen3.5-plus"
+  },
+  "notes": "请将此文件重命名为 models.json 并填入你的真实 API 密钥。切勿将真实密钥提交到 Git。"
+}

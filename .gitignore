@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# Virtual Environment
+.venv/
+venv/
+ENV/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Task Data (runtime state)
+tasks/
+history/
+*.db
+*.db-shm
+*.db-wal
+
+# API Configuration (contains sensitive keys)
+models.json
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db

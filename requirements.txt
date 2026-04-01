@@ -1,0 +1,21 @@
+# edict-dev LangGraph 工作流依赖
+# 安装命令：pip install -r requirements.txt
+
+# LangGraph 核心
+langgraph>=1.0.0
+langgraph-checkpoint>=2.1.0
+
+# LangChain (兼容版本，与 langchain-dashscope 配合)
+langchain>=0.3.0,<1.0.0
+langchain-core>=0.3.0,<1.0.0
+langchain-dashscope==0.1.8
+
+# DashScope 阿里云通义千问 SDK
+dashscope>=1.14.1
+
+# 其他依赖（自动安装）
+# - pydantic>=2.7.4
+# - pyyaml>=5.3.0
+# - requests>=2.0.0
+# - httpx>=0.25.2
+# - tenacity>=8.1.0
