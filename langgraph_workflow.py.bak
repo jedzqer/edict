@@ -469,7 +469,7 @@ def zhongshu_node(state: EdictState) -> EdictState:
 }
 ```
 
-可用部门：户部（资源预算）、礼部（文档写作）、
+可用部门：吏部（组织治理）、户部（资源预算）、礼部（文档写作）、
 兵部（代码实现）、刑部（安全审查）、工部（部署构建）
 
 请根据任务需要合理分配部门，不要遗漏必要的部门。"""
@@ -573,10 +573,10 @@ def _plan_governance_with_llm(state: "EdictState",
 请根据用户任务、执行计划和六部输出摘要，判断：
 - 刑部（xingbu）：是否存在安全/合规/高风险问题需要审查
 - 户部（hubu）：是否存在资源/预算/成本问题需要评估
-
+- 吏部（libu_admin）：是否存在角色变更/组织架构/治理问题需要处理
 
 输出必须是 JSON：
-{"xingbu": true/false, "hubu": true/false, "reason": "简要说明"}"""
+{"xingbu": true/false, "hubu": true/false, "libu_admin": true/false, "reason": "简要说明"}"""
 
     user_content = (
         f"用户任务：{state['user_input']}\n\n"
