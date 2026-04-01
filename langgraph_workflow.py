@@ -16,6 +16,7 @@ import os
 import re
 import sqlite3
 import logging
+import threading
 import concurrent.futures
 from pathlib import Path
 from datetime import datetime
@@ -31,8 +32,6 @@ import subprocess
 from langchain_core.tools import tool
 from langgraph.prebuilt import create_react_agent
 
-WORK_DIR = EDICT_DIR / "work"
-WORK_DIR.mkdir(parents=True, exist_ok=True)
 
 @tool
 def read_file(file_path: str) -> str:
@@ -63,16 +62,17 @@ def execute_command(command: str) -> str:
     """Execute a shell command in the work directory."""
     try:
         result = subprocess.run(command, shell=True, cwd=WORK_DIR, capture_output=True, text=True, timeout=30)
-        return f"STDOUT:
-{result.stdout}
-STDERR:
-{result.stderr}"
+        return f"STDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
     except Exception as e:
         return f"Error executing command: {e}"
 
-def execute_ministry(ministry_key: str, task_desc: str, state: "EdictState", logger: logging.Logger) -> dict:
+def execute_ministry(ministry_key: str, task_desc: str, state: "EdictState",
+                     logger: logging.Logger, task_dir: Optional[Path] = None) -> dict:
     ministry_name = ROLE_DISPLAY_NAMES.get(ministry_key, ministry_key)
     logger.info(f"  → {ministry_name} 开始执行：{task_desc[:80]}...")
+
+    output_file = (task_dir / f"{ministry_key}.output") if task_dir else None
+
     try:
         role_prompt = load_role_prompt(ministry_key)
         context = (
@@ -80,16 +80,16 @@ def execute_ministry(ministry_key: str, task_desc: str, state: "EdictState", log
             f"工作流指定你的任务是：{task_desc}\n\n"
             f"说明：你可以使用工具在 {WORK_DIR} 目录下读写文件。"
         )
-        
+
         # Select tools based on role
         tools = [read_file]
         if ministry_key in ["bingbu", "gongbu", "libu"]:
             tools.append(write_file)
         if ministry_key == "gongbu":
             tools.append(execute_command)
-            
+
         llm = _get_llm_for_role(ministry_key)
-        
+
         try:
             # LangGraph v1.0 syntax
             agent = create_react_agent(llm, tools=tools, state_modifier=role_prompt)
@@ -103,20 +103,91 @@ def execute_ministry(ministry_key: str, task_desc: str, state: "EdictState", log
                 ("human", "{input}"),
                 ("placeholder", "{agent_scratchpad}"),
             ])
-            agent = create_tool_calling_agent(llm, tools, prompt)
-            agent = AgentExecutor(agent=agent, tools=tools)
+            agent_chain = create_tool_calling_agent(llm, tools, prompt)
+            agent = AgentExecutor(agent=agent_chain, tools=tools)
 
-        try:
-            res = agent.invoke({"messages": [("user", context)]})
-            output = res["messages"][-1].content
-        except:
-            res = agent.invoke({"input": context})
-            output = res["output"]
+        def _stream_to_file(agent_obj) -> str:
+            """流式执行并实时写入输出文件，返回最终输出文本"""
+            if output_file is None:
+                # 无文件目标，直接 invoke
+                try:
+                    res = agent_obj.invoke({"messages": [("user", context)]})
+                    return res["messages"][-1].content
+                except Exception:
+                    res = agent_obj.invoke({"input": context})
+                    return res["output"]
+
+            output_file.parent.mkdir(parents=True, exist_ok=True)
+            parts: list[str] = []
+            with open(str(output_file), "w", encoding="utf-8") as f:
+                header = (
+                    f"# {ministry_name} 执行日志\n"
+                    f"任务：{task_desc}\n"
+                    f"开始时间：{datetime.now().isoformat()}\n"
+                    f"{'='*60}\n\n"
+                )
+                f.write(header)
+                f.flush()
+                logger.info(f"{ministry_name} 输出文件：{output_file}")
+
+                try:
+                    for chunk in agent_obj.stream({"messages": [("user", context)]}):
+                        for _node, node_data in chunk.items():
+                            msgs = node_data.get("messages", []) if isinstance(node_data, dict) else []
+                            for msg in msgs:
+                                content = getattr(msg, "content", "") or ""
+                                tool_calls = getattr(msg, "tool_calls", []) or []
+                                ts = datetime.now().strftime("%H:%M:%S")
+                                msg_type = type(msg).__name__
+
+                                if tool_calls:
+                                    for tc in tool_calls:
+                                        line = (
+                                            f"[{ts}][工具调用] {tc.get('name', '')}"
+                                            f"({json.dumps(tc.get('args', {}), ensure_ascii=False)})\n"
+                                        )
+                                        f.write(line)
+                                        f.flush()
+                                        logger.debug(f"{ministry_name} 工具调用: {tc.get('name', '')}")
+
+                                if content and content.strip():
+                                    f.write(f"[{ts}][{msg_type}] {content}\n")
+                                    f.flush()
+                                    parts.append(content)
+                except Exception as stream_err:
+                    logger.warning(f"{ministry_name} 流式输出失败，回退到 invoke：{stream_err}")
+                    parts = []
+                    try:
+                        res = agent_obj.invoke({"messages": [("user", context)]})
+                        fallback_output = res["messages"][-1].content
+                    except Exception:
+                        res = agent_obj.invoke({"input": context})
+                        fallback_output = res["output"]
+                    f.write(fallback_output)
+                    f.flush()
+                    parts = [fallback_output]
+
+                f.write(f"\n{'='*60}\n完成时间：{datetime.now().isoformat()}\n")
+                f.flush()
+
+            # 若无文本部分（如全为工具调用），读回文件中的完整内容作为输出
+            if not parts:
+                try:
+                    with open(str(output_file), "r", encoding="utf-8") as rf:
+                        return rf.read()
+                except Exception:
+                    return ""
+            return parts[-1]
+
+        output = _stream_to_file(agent)
 
         logger.info(f"  ← {ministry_name} 执行完成")
         return {"output": output, "status": "success", "timestamp": datetime.now().isoformat()}
     except Exception as e:
         logger.error(f"  ← {ministry_name} 执行异常：{e}")
+        if output_file:
+            with open(str(output_file), "a", encoding="utf-8") as f:
+                f.write(f"\n[ERROR] {datetime.now().isoformat()} {e}\n")
         return {"output": str(e), "status": "error", "timestamp": datetime.now().isoformat()}
 
 
@@ -126,39 +197,66 @@ TASKS_DIR = EDICT_DIR / "tasks"
 HISTORY_DIR = EDICT_DIR / "history"
 ROLES_DIR = EDICT_DIR / "roles"
 DB_PATH = EDICT_DIR / "tasks.db"
+WORK_DIR = EDICT_DIR / "work"
 
 TASKS_DIR.mkdir(parents=True, exist_ok=True)
 HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+WORK_DIR.mkdir(parents=True, exist_ok=True)
 
 MAX_REVISIONS = 3
 MAX_RETRIES = 3
 
 # ==================== 日志系统 ====================
 
+_logger_lock = threading.Lock()
+
+
 def setup_logger(task_id: str) -> logging.Logger:
-    """为任务设置日志记录器，日志保存到 history/{date}.log"""
+    """
+    为任务设置日志记录器。
+    - history/{date}.log  : 跨任务汇总（带 task_id 标签，便于全局检索）
+    - tasks/{task_id}/session.log : 单任务完整会话记录（仅当前任务）
+    使用锁保证多线程安全（六部并行时不重复添加 handler）。
+    """
     logger = logging.getLogger(f"edict.{task_id}")
-    if logger.handlers:
-        return logger
+    with _logger_lock:
+        if logger.handlers:
+            return logger
 
-    logger.setLevel(logging.DEBUG)
+        logger.setLevel(logging.DEBUG)
+        logger.propagate = False
 
-    log_file = HISTORY_DIR / f"{datetime.now().strftime('%Y%m%d')}.log"
-    file_handler = logging.FileHandler(log_file, encoding="utf-8")
-    file_handler.setLevel(logging.DEBUG)
+        fmt_history = logging.Formatter(
+            f"[%(asctime)s] [{task_id}] [%(levelname)s] %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S"
+        )
+        fmt_session = logging.Formatter(
+            "[%(asctime)s] [%(levelname)s] %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S"
+        )
 
-    console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging.INFO)
+        # history/{date}.log — 跨任务汇总
+        log_file = HISTORY_DIR / f"{datetime.now().strftime('%Y%m%d')}.log"
+        fh = logging.FileHandler(str(log_file), encoding="utf-8", mode="a")
+        fh.setLevel(logging.DEBUG)
+        fh.setFormatter(fmt_history)
+        logger.addHandler(fh)
 
-    fmt = logging.Formatter(
-        f"[%(asctime)s] [{task_id}] [%(levelname)s] %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S"
-    )
-    file_handler.setFormatter(fmt)
-    console_handler.setFormatter(fmt)
+        # tasks/{task_id}/session.log — 单任务会话
+        task_dir = TASKS_DIR / task_id
+        task_dir.mkdir(parents=True, exist_ok=True)
+        session_log = task_dir / "session.log"
+        sh = logging.FileHandler(str(session_log), encoding="utf-8", mode="a")
+        sh.setLevel(logging.DEBUG)
+        sh.setFormatter(fmt_session)
+        logger.addHandler(sh)
 
-    logger.addHandler(file_handler)
-    logger.addHandler(console_handler)
+        # 控制台
+        ch = logging.StreamHandler()
+        ch.setLevel(logging.INFO)
+        ch.setFormatter(fmt_history)
+        logger.addHandler(ch)
+
     return logger
 
 
@@ -168,6 +266,16 @@ if not global_logger.handlers:
     _ch = logging.StreamHandler()
     _ch.setFormatter(logging.Formatter("[%(asctime)s] [%(levelname)s] %(message)s"))
     global_logger.addHandler(_ch)
+
+
+def write_node_output(task_id: str, filename: str, content: str) -> None:
+    """将节点输出实时写入 tasks/{task_id}/{filename}"""
+    task_dir = TASKS_DIR / task_id
+    task_dir.mkdir(parents=True, exist_ok=True)
+    output_path = task_dir / filename
+    with open(str(output_path), "w", encoding="utf-8") as f:
+        f.write(content)
+        f.flush()
 
 
 # ==================== 配置 ====================
@@ -550,6 +658,16 @@ def zhongshu_node(state: EdictState) -> EdictState:
     logger.info(f"中书省规划完成，计划长度：{len(plan_text)} 字符")
     log_event_to_db(task_id, "node_complete", "zhongshu", f"规划完成，长度 {len(plan_text)}")
 
+    # 实时写入计划文件
+    revision = state.get("revision_count", 0)
+    fname = f"zhongshu_plan_r{revision}.output" if revision > 0 else "zhongshu_plan.output"
+    write_node_output(
+        task_id, fname,
+        f"# 中书省 规划（第{revision+1}轮）\n"
+        f"时间：{datetime.now().isoformat()}\n"
+        f"{'='*60}\n\n{plan_text}\n"
+    )
+
     return {
         "plan": plan_text,
         "revision_count": state.get("revision_count", 0) + 1,
@@ -588,6 +706,11 @@ def menxia_node(state: EdictState) -> EdictState:
     review_result = call_llm_with_retry(system_prompt, user_content, role="menxia")
 
     logger.info(f"门下省审核结果：{review_result[:200]}...")
+    revision = state.get("revision_count", 0)
+    write_node_output(
+        task_id, f"menxia_review_r{revision}.output",
+        f"# 门下省 审核（第{revision}轮）\n时间：{datetime.now().isoformat()}\n{'='*60}\n\n{review_result}\n"
+    )
 
     parsed = extract_json_from_output(review_result)
     if parsed:
@@ -733,10 +856,13 @@ def shangshu_node(state: EdictState) -> EdictState:
 
     # 并行执行六部任务（ThreadPoolExecutor，避免 asyncio 死锁）
     ministry_results: Dict[str, Dict[str, Any]] = dict(state.get("ministry_results", {}))
+    _validate_task_id(task_id)
+    task_dir = TASKS_DIR / task_id
+    task_dir.mkdir(parents=True, exist_ok=True)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(dispatch_map) or 1) as executor:
         future_map = {
-            executor.submit(execute_ministry, dept_key, task_desc, state, logger): dept_key
+            executor.submit(execute_ministry, dept_key, task_desc, state, logger, task_dir): dept_key
             for dept_key, task_desc in dispatch_map.items()
         }
         for future in concurrent.futures.as_completed(future_map):
@@ -751,18 +877,17 @@ def shangshu_node(state: EdictState) -> EdictState:
                     "timestamp": datetime.now().isoformat()
                 }
 
-    # 保存结果到文件（L2: 写出 output 字段）
-    _validate_task_id(task_id)
-    task_dir = TASKS_DIR / task_id
-    task_dir.mkdir(parents=True, exist_ok=True)
-    for dept_key, result in ministry_results.items():
-        output_file = task_dir / f"{dept_key}.output"
-        output_text = result.get("output", "") if isinstance(result, dict) else str(result)
-        output_file.write_text(output_text, encoding="utf-8")
-
     # M1: 用 LLM 语义分析决定需要哪些治理部门
     governance_plan = _plan_governance_with_llm(state, ministry_results, logger)
     logger.info(f"治理计划：{governance_plan}")
+
+    # 写入尚书省派发日志
+    write_node_output(
+        task_id, "shangshu_dispatch.output",
+        f"# 尚书省 派发日志\n时间：{datetime.now().isoformat()}\n{'='*60}\n\n"
+        f"## 派发结果\n{dispatch_result}\n\n"
+        f"## 治理计划\n{json.dumps(governance_plan, ensure_ascii=False, indent=2)}\n"
+    )
 
     log_event_to_db(task_id, "node_complete", "shangshu",
                     f"六部执行完成，共 {len(ministry_results)} 个结果")
@@ -793,13 +918,22 @@ def libu_admin_node(state: EdictState) -> EdictState:
     )
 
     try:
-        result = call_llm_with_retry(role_prompt, context)
-    except Exception as e:
+        result_text = call_llm_with_retry(role_prompt, context, role="libu_admin")
+        ministry_result: Dict[str, Any] = {
+            "output": result_text, "status": "success", "timestamp": datetime.now().isoformat()
+        }
+    except EdictExecutionError as e:
         logger.error(f"吏部执行异常：{e}")
-        result = f"Error: {str(e)}"
+        ministry_result = {"output": str(e), "status": "error", "timestamp": datetime.now().isoformat()}
+        result_text = str(e)
+
+    write_node_output(
+        task_id, "libu_admin.output",
+        f"# 吏部 执行日志\n时间：{datetime.now().isoformat()}\n{'='*60}\n\n{result_text}\n"
+    )
 
     ministry_results = dict(state.get("ministry_results", {}))
-    ministry_results["libu_admin"] = result
+    ministry_results["libu_admin"] = ministry_result
 
     log_event_to_db(task_id, "node_complete", "libu_admin", "吏部治理完成")
     return {
@@ -837,6 +971,11 @@ def hubu_node(state: EdictState) -> EdictState:
 
     ministry_results = dict(state.get("ministry_results", {}))
     ministry_results["hubu"] = ministry_result
+
+    write_node_output(
+        task_id, "hubu.output",
+        f"# 户部 资源评估\n时间：{datetime.now().isoformat()}\n{'='*60}\n\n{ministry_result.get('output', '')}\n"
+    )
 
     log_event_to_db(task_id, "node_complete", "hubu", "户部评估完成")
     return {
@@ -896,6 +1035,11 @@ def xingbu_node(state: EdictState) -> EdictState:
     ministry_results = dict(state.get("ministry_results", {}))
     ministry_results["xingbu"] = ministry_result
 
+    write_node_output(
+        task_id, "xingbu.output",
+        f"# 刑部 安全审查\n时间：{datetime.now().isoformat()}\n风险级别：{new_priority}\n{'='*60}\n\n{ministry_result.get('output', '')}\n"
+    )
+
     log_event_to_db(task_id, "node_complete", "xingbu", "刑部审查完成")
     return {
         "ministry_results": ministry_results,
@@ -944,6 +1088,11 @@ def menxia_final_node(state: EdictState) -> EdictState:
 
     log_event_to_db(task_id, "node_complete", "menxia_final", f"终验完成：{review[:200]}")
     logger.info(f"门下省终验结果：{review[:200]}")
+
+    write_node_output(
+        task_id, "menxia_final.output",
+        f"# 门下省·终验 执行日志\n时间：{datetime.now().isoformat()}\n{'='*60}\n\n{review}\n"
+    )
 
     return {"updated_at": datetime.now().isoformat()}
 
@@ -998,6 +1147,8 @@ def finalize_node(state: EdictState) -> EdictState:
 
     logger.info(f"最终报告生成完成，长度：{len(final_report)} 字符")
     log_event_to_db(task_id, "node_complete", "finalize", f"报告长度 {len(final_report)}")
+
+    write_node_output(task_id, "finalize.output", final_report)
 
     return {
         "final_output": final_report,
