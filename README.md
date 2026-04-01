@@ -1,8 +1,7 @@
-# edict-dev · 三省六部制 AI 协作系统 (开发分支)
+# edict-dev · 三省六部制 AI 协作系统
 
 > **🏛️ 用 1300 年前的帝国智慧，设计现代 AI 协作架构**
 
-本分支用于测试新架构（LangGraph 重构），生产环境请使用 `edict` 主分支。
 
 ---
 
@@ -95,17 +94,7 @@ python langgraph_workflow.py "开发一个 Flask API 项目"
 | **[SKILL.md](SKILL.md)** | Skill 定义和使用 | 所有用户 |
 | **[langgraph_workflow.py](langgraph_workflow.py)** | LangGraph 实现代码 | 开发者 |
 
-### 研究文档
-
-> ⚠️ 以下文档尚未创建，计划补充中。
-
-| 文档 | 说明 |
-|------|------|
-| langgraph-research.md | 完整 LangGraph 研究报告 |
-| langgraph-quickstart.md | LangGraph 快速上手教程 |
-| langgraph-architecture.md | Mermaid 架构图 |
-
-### 历史文档
+### 文档
 
 | 文档 | 说明 |
 |------|------|
@@ -122,7 +111,7 @@ python langgraph_workflow.py "开发一个 Flask API 项目"
 python langgraph_workflow.py "创建 Python Flask API 项目"
 ```
 
-### 作为 nanobot Skill
+### 作为 Skill
 
 ```python
 from edict.langgraph_workflow import run_langgraph_workflow
@@ -144,30 +133,6 @@ result = run_langgraph_workflow("帮我创建 Flask 项目")
 
 ---
 
-## 🧪 测试计划
-
-### 阶段 1: 功能验证
-
-- [x] 三省主链运行
-- [x] 驳回循环测试
-- [ ] 六部子图完整测试
-- [ ] 持久化测试
-
-### 阶段 2: 性能对比
-
-- [ ] 响应时间对比
-- [ ] 资源消耗对比
-- [ ] 稳定性测试
-
-### 阶段 3: 生产就绪
-
-- [ ] LangSmith 集成
-- [ ] 错误处理增强
-- [ ] 文档完善
-- [ ] 用户测试
-
----
-
 ## ⚠️ 注意事项
 
 1. **依赖安装**: 使用虚拟环境 `source .venv/bin/activate`
@@ -182,7 +147,3 @@ result = run_langgraph_workflow("帮我创建 Flask 项目")
 - **LangSmith 监控**: https://smith.langchain.com/
 - **edict 主分支**: `<workspace>/skills/edict/`
 
-
----
-
-**状态**: ❌ 生产就绪
