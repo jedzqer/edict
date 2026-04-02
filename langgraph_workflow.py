@@ -153,32 +153,44 @@ def infer_project_root(text: str) -> Optional[str]:
 
 
 def normalize_dispatch_department(task_desc: str, dept_key: str) -> str:
-    """基于任务语义强制收敛到正确部门，避免尚书省派工越权。"""
+    """保守纠偏派工：仅在出现非常明确的前后端/文档越权时才改派。"""
     text = task_desc.lower()
+
+    # 这些部门不应被关键词纠偏，避免把资源治理/安全审计/组织治理误改派。
+    if dept_key in {"hubu", "xingbu", "libu_admin"}:
+        return dept_key
+
+    # 若任务本身是审查、裁决、确认类工作，也不要靠关键词挪给礼部。
+    if any(marker in text for marker in ["尚书省", "门下省", "中书省", "审查当前", "核验", "确认"]):
+        return dept_key
+
     frontend_markers = [
         ".html", ".css", ".js", "前端", "页面", "样式", "组件", "交互", "浏览器", "静态资源",
         "canvas", "game.js", "index.html", "ui", "ux"
     ]
     backend_markers = [
-        ".py", "后端", "flask", "fastapi", "api", "接口", "服务", "数据库", "持久化",
-        "server.py", "app.py", "json存储", "sqlite"
+        ".py", "后端", "flask", "fastapi", "api", "接口", "服务逻辑", "数据库访问", "数据持久化",
+        "server.py", "app.py", "sqlite"
     ]
     doc_markers = [
-        "readme", ".md", "文档", "说明", "部署文档", "接口文档", "用户手册", "说明文案"
-    ]
-    ops_markers = [
-        "requirements.txt", "虚拟环境", "依赖安装", "pip install", "npm install", "启动服务",
-        "运行验证", "构建", "部署", "部署脚本", "静态文件路由"
+        "readme", "文档", "接口文档", "部署文档", "用户手册", "说明文案", "操作说明", "使用说明"
     ]
 
-    if any(marker in text for marker in doc_markers):
-        return "libu"
-    if any(marker in text for marker in ops_markers):
+    has_frontend = any(marker in text for marker in frontend_markers)
+    has_backend = any(marker in text for marker in backend_markers)
+    has_docs = any(marker in text for marker in doc_markers)
+
+    # 只修正明确的职责冲突，不根据模糊词（如“说明”“启动服务”“数据库”）跨部门改派。
+    if dept_key == "bingbu" and has_frontend and not has_backend:
         return "gongbu"
-    if any(marker in text for marker in frontend_markers):
-        return "gongbu"
-    if any(marker in text for marker in backend_markers):
+    if dept_key == "gongbu" and has_backend and not has_frontend:
         return "bingbu"
+    if dept_key in {"bingbu", "gongbu"} and has_docs and not has_frontend and not has_backend:
+        return "libu"
+    if dept_key == "libu" and has_backend and not has_docs:
+        return "bingbu"
+    if dept_key == "libu" and has_frontend and not has_docs:
+        return "gongbu"
     return dept_key
 
 
@@ -206,6 +218,144 @@ def normalize_stage_plan(stages: list[dict], logger: logging.Logger) -> list[dic
         stage_copy["departments"] = normalized_departments
         normalized_stages.append(stage_copy)
     return normalized_stages
+
+
+def extract_plan_contracts(plan_text: str) -> Dict[str, Any]:
+    """从中书省规划中提取结构化契约，供尚书省派工时下发。"""
+    plan_json = extract_json_from_output(plan_text) or {}
+    architecture = plan_json.get("architecture", {}) if isinstance(plan_json, dict) else {}
+    steps = {}
+    for step in plan_json.get("steps", []) if isinstance(plan_json, dict) else []:
+        if isinstance(step, dict) and step.get("step_id") is not None:
+            steps[str(step["step_id"])] = step
+    return {
+        "project_root": architecture.get("project_root", ""),
+        "interface_contracts": [
+            contract for contract in architecture.get("interface_contracts", [])
+            if isinstance(contract, dict)
+        ],
+        "steps": steps,
+    }
+
+
+def format_dispatch_contracts(
+    task_desc: str,
+    dept_key: str,
+    dispatch_info: Dict[str, Any],
+    plan_contracts: Dict[str, Any],
+) -> str:
+    """把关键文件路径、验收标准、接口契约追加到部门任务中，减少自由发挥。"""
+    lines = [task_desc.strip()]
+    project_root = plan_contracts.get("project_root")
+    step_id = dispatch_info.get("derived_from_step")
+    step = plan_contracts.get("steps", {}).get(str(step_id)) if step_id is not None else None
+    constraints = [str(item) for item in dispatch_info.get("constraints", []) if str(item).strip()]
+    task_paths = extract_work_paths(task_desc)
+
+    lines.append("\n【结构化派工约束】")
+    lines.append(f"- 指派部门：{ROLE_DISPLAY_NAMES.get(dept_key, dept_key)}")
+    if project_root:
+        lines.append(f"- 统一项目根目录：{project_root}")
+    if task_paths:
+        lines.append(f"- 当前任务中出现的目标路径：{', '.join(task_paths)}")
+    if step:
+        lines.append(f"- 来源步骤：step {step.get('step_id')} - {step.get('description', '')}")
+        expected_output = str(step.get("expected_output", "")).strip()
+        if expected_output:
+            lines.append(f"- 该步骤预期交付物：{expected_output}")
+        acceptance = str(step.get("acceptance_criteria", "")).strip()
+        if acceptance:
+            lines.append(f"- 该步骤验收标准：{acceptance}")
+    if constraints:
+        lines.append(f"- 尚书省附加约束：{'；'.join(constraints)}")
+
+    contracts = plan_contracts.get("interface_contracts", [])
+    if contracts:
+        lines.append("- 共享接口契约：")
+        for contract in contracts:
+            name = contract.get("name", "未命名契约")
+            producer = contract.get("producer", "未知产生方")
+            consumer = contract.get("consumer", "未知使用方")
+            details = contract.get("details", "")
+            lines.append(f"  * {name} | {producer} -> {consumer} | {details}")
+
+    lines.append("执行要求：优先遵守以上路径、接口、验收标准；若与自由文本冲突，以结构化约束为准。")
+    return "\n".join(lines)
+
+
+def _stage_department_keys(stage_info: Dict[str, Any]) -> set[str]:
+    keys: set[str] = set()
+    for dept in stage_info.get("departments", []):
+        dept_name = str(dept.get("name", ""))
+        dept_key = normalize_department(dept_name)
+        if dept_key:
+            keys.add(dept_key)
+    return keys
+
+
+def _steps_are_dependent(step_a: Any, step_b: Any, plan_contracts: Dict[str, Any]) -> bool:
+    steps = plan_contracts.get("steps", {})
+    a = steps.get(str(step_a)) if step_a is not None else None
+    b = steps.get(str(step_b)) if step_b is not None else None
+    deps_a = {str(dep) for dep in a.get("dependencies", [])} if isinstance(a, dict) else set()
+    deps_b = {str(dep) for dep in b.get("dependencies", [])} if isinstance(b, dict) else set()
+    if step_a is None or step_b is None:
+        return False
+    return str(step_a) in deps_b or str(step_b) in deps_a
+
+
+def allow_parallel_frontend_backend(
+    stages: list[dict],
+    plan_contracts: Dict[str, Any],
+    logger: logging.Logger,
+) -> list[dict]:
+    """在接口契约已明确时，允许兵部与工部并发开发，联调再后置。"""
+    if not plan_contracts.get("interface_contracts"):
+        return stages
+
+    optimized: list[dict] = []
+    idx = 0
+    while idx < len(stages):
+        current = dict(stages[idx])
+        if idx + 1 >= len(stages):
+            optimized.append(current)
+            break
+
+        nxt = dict(stages[idx + 1])
+        current_keys = _stage_department_keys(current)
+        next_keys = _stage_department_keys(nxt)
+
+        can_merge = (
+            current_keys == {"bingbu"} and next_keys == {"gongbu"}
+            or current_keys == {"gongbu"} and next_keys == {"bingbu"}
+        )
+
+        if not can_merge:
+            optimized.append(current)
+            idx += 1
+            continue
+
+        current_step = current.get("departments", [{}])[0].get("derived_from_step")
+        next_step = nxt.get("departments", [{}])[0].get("derived_from_step")
+        if _steps_are_dependent(current_step, next_step, plan_contracts):
+            optimized.append(current)
+            idx += 1
+            continue
+
+        merged = dict(current)
+        merged["description"] = (
+            f"{current.get('description', '')} + {nxt.get('description', '')}"
+        ).strip(" +")
+        merged["departments"] = list(current.get("departments", [])) + list(nxt.get("departments", []))
+        optimized.append(merged)
+        logger.info(
+            "尚书省阶段优化：检测到中书省已提供接口契约，合并相邻阶段以并发执行兵部/工部开发。"
+        )
+        idx += 2
+
+    for order, stage in enumerate(optimized, start=1):
+        stage["stage"] = order
+    return optimized
 
 
 @tool
@@ -1106,17 +1256,19 @@ def shangshu_node(state: EdictState) -> EdictState:
 
     system_prompt = """你是尚书省尚书令，负责协调六部执行任务，并在执行后按文件产物进行阶段验收。
 
-根据计划内容，决定：
-1. 需要调用哪些部门（只调用确实需要的部门，不必所有部门都派活）
-2. 各部门的执行顺序：有依赖关系的放入不同阶段（stage），同一阶段内并行执行
-3. 每个任务必须尽量指向 work/<项目名>/ 下的具体交付物，避免空泛描述
-4. 尚书省必须先看真实文件产物再放行；若有写权限的部门未写文件，应由原部门返工，不得直接带过
+    根据计划内容，决定：
+    1. 需要调用哪些部门（只调用确实需要的部门，不必所有部门都派活）
+    2. 各部门的执行顺序：有依赖关系的放入不同阶段（stage），同一阶段内并行执行
+    3. 每个任务必须尽量指向 work/<项目名>/ 下的具体交付物，避免空泛描述
+    4. 尚书省必须先看真实文件产物再放行；若有写权限的部门未写文件，应由原部门返工，不得直接带过
 
-执行规则：
-- 若某部门的输出会影响另一个部门的工作（如户部的资源建议要传递给兵部），则户部放早期阶段，兵部放后续阶段
-- 派工前必须先从计划中确认统一项目根目录，并在任务描述里显式写出 `work/<项目名>/...` 目标路径
-- 兵部负责后端代码与服务逻辑；工部负责前端页面、HTML/CSS/JS、构建、依赖安装、启动验证与部署；礼部负责 README、说明文档、接口文档与文案
-- 吏部只负责组织治理，不承担虚拟环境创建、依赖安装、测试执行、部署验证
+    执行规则：
+    - 若某部门的输出会影响另一个部门的工作（如户部的资源建议要传递给兵部），则户部放早期阶段，兵部放后续阶段
+    - 派工前必须先从计划中确认统一项目根目录，并在任务描述里显式写出 `work/<项目名>/...` 目标路径
+    - 兵部负责后端代码与服务逻辑；工部负责前端页面、HTML/CSS/JS、构建、依赖安装、启动验证与部署；礼部负责 README、说明文档、接口文档与文案
+    - 若中书省已经提供明确的 interface_contracts（接口路径、请求响应、共享数据结构），则兵部与工部可以在同一阶段并发开发，不要机械拆成“兵部先写、工部后写”
+    - 前后端并发开发时，应把“按既定接口契约分别实现”写入兵部和工部任务；联调、启动验证、端到端测试可放到后续阶段
+    - 吏部只负责组织治理，不承担虚拟环境创建、依赖安装、测试执行、部署验证
 - Python 虚拟环境、依赖安装、启动验证、部署脚本只能交给工部，不要派给吏部、户部或礼部
 - HTML/CSS/JS、前端页面、动画和浏览器交互只能交给工部，不要派给兵部
 - 后端 Python、API、服务逻辑、数据持久化只能交给兵部，不要派给工部
@@ -1166,6 +1318,7 @@ def shangshu_node(state: EdictState) -> EdictState:
         )
     )
 
+    plan_contracts = extract_plan_contracts(state.get("plan", ""))
     dispatch_result = call_llm_with_retry(system_prompt, user_content, role="shangshu")
     logger.info(f"尚书省分配方案：{dispatch_result[:200]}...")
 
@@ -1178,7 +1331,7 @@ def shangshu_node(state: EdictState) -> EdictState:
         stages = [{"stage": 1, "description": "默认执行", "departments": [{"name": "兵部", "task": state["user_input"]}]}]
     else:
         stages = normalize_stage_plan(stages, logger)
-
+        stages = allow_parallel_frontend_backend(stages, plan_contracts, logger)
     ministry_results: Dict[str, Dict[str, Any]] = dict(state.get("ministry_results", {}))
     all_dispatch_tasks: Dict[str, str] = {}
     _validate_task_id(task_id)
@@ -1211,7 +1364,12 @@ def shangshu_node(state: EdictState) -> EdictState:
                 continue
             if not validate_flow("shangshu", dept_key, logger):
                 continue
-            task_desc = m.get("task", "") + prior_outputs
+            task_desc = format_dispatch_contracts(
+                m.get("task", ""),
+                dept_key,
+                m,
+                plan_contracts,
+            ) + prior_outputs
             stage_dispatch[dept_key] = task_desc
             all_dispatch_tasks[dept_key] = task_desc
 
@@ -1222,8 +1380,17 @@ def shangshu_node(state: EdictState) -> EdictState:
         logger.info(f"阶段 {stage_num}（{stage_desc}）：并行执行 {list(stage_dispatch.keys())}")
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(stage_dispatch)) as executor:
+            state_for_stage = dict(state)
+            state_for_stage["ministry_results"] = dict(ministry_results)
             future_map = {
-                executor.submit(execute_ministry, dept_key, task_desc, state, logger, task_dir): dept_key
+                executor.submit(
+                    execute_ministry,
+                    dept_key,
+                    task_desc,
+                    state_for_stage,
+                    logger,
+                    task_dir,
+                ): dept_key
                 for dept_key, task_desc in stage_dispatch.items()
             }
             for future in concurrent.futures.as_completed(future_map):
@@ -1269,6 +1436,8 @@ def shangshu_node(state: EdictState) -> EdictState:
         )
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(rework_targets)) as executor:
+            state_for_rework = dict(state)
+            state_for_rework["ministry_results"] = dict(ministry_results)
             future_map = {
                 executor.submit(
                     execute_ministry,
@@ -1279,7 +1448,7 @@ def shangshu_node(state: EdictState) -> EdictState:
                         ministry_results.get(dept_key),
                         delivery_feedback=delivery_feedback,
                     ),
-                    state,
+                    state_for_rework,
                     logger,
                     task_dir,
                 ): dept_key
