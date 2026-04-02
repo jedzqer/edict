@@ -291,6 +291,8 @@ WORK_DIR.mkdir(parents=True, exist_ok=True)
 
 MAX_REVISIONS = 3
 MAX_RETRIES = 3
+MAX_SHANGSHU_REWORK_ROUNDS = 2
+MAX_DELIVERY_REVISIONS = 2
 
 # ==================== 日志系统 ====================
 
@@ -625,6 +627,9 @@ class EdictState(TypedDict):
     created_at: str
     updated_at: str
     status: str
+    dispatch_revision_count: int
+    delivery_review_status: Literal["pending", "approved", "rejected"]
+    delivery_review_feedback: str
 
 
 
@@ -688,6 +693,61 @@ def load_role_prompt(role: str) -> str:
     if not role_file.exists():
         return f"你是{role}，请根据任务上下文完成工作。"
     return role_file.read_text(encoding="utf-8")
+
+
+WRITE_REQUIRED_DEPARTMENTS = {"bingbu", "libu", "gongbu"}
+
+
+def has_file_changes(result: Optional[Dict[str, Any]]) -> bool:
+    """判断部门结果是否包含真实文件变更。"""
+    if not isinstance(result, dict):
+        return False
+    changes = result.get("file_changes", {})
+    return any(changes.get(key) for key in ["created", "modified", "deleted"])
+
+
+def should_rework_department(dept_key: str, result: Optional[Dict[str, Any]]) -> bool:
+    """判断某部门是否应被尚书省勒令返工。"""
+    if not isinstance(result, dict):
+        return True
+    status = result.get("status", "")
+    if status == "error":
+        return True
+    if dept_key in WRITE_REQUIRED_DEPARTMENTS and not has_file_changes(result):
+        return True
+    return False
+
+
+def build_rework_task(
+    dept_key: str,
+    original_task: str,
+    result: Optional[Dict[str, Any]],
+    delivery_feedback: str = "",
+) -> str:
+    """生成尚书省返工指令。"""
+    reasons: list[str] = []
+    if not isinstance(result, dict):
+        reasons.append("系统未拿到有效执行结果。")
+    else:
+        if result.get("status") == "error":
+            reasons.append(f"上轮执行异常：{result.get('output', '')[:240]}")
+        if dept_key in WRITE_REQUIRED_DEPARTMENTS and not has_file_changes(result):
+            reasons.append("上轮未在 work/ 目录产生任何真实文件变更。")
+        if result.get("status") == "partial":
+            reasons.append("上轮结果仅为部分完成，未达到文件级交付要求。")
+    if delivery_feedback:
+        reasons.append(f"门下省/上级复核意见：{delivery_feedback[:400]}")
+
+    rework_rules = (
+        "\n\n【尚书省复核结论】\n"
+        + "\n".join(f"- {reason}" for reason in reasons)
+        + "\n\n【返工要求】\n"
+        "- 本轮必须把结果真实写入 work/，不能只做文字说明。\n"
+        "- 不得先写探测脚本、目录巡检脚本或与目标无关的辅助文件代替正式交付。\n"
+        "- 若你具备 write_file 权限，则至少产出与任务直接相关的目标文件。\n"
+        "- 若仍无法完成，必须明确说明阻塞原因，并指出缺失的具体文件或前置产物。"
+    )
+    return f"{original_task}{rework_rules}"
 
 
 # execute_ministry moved above
@@ -892,16 +952,22 @@ def shangshu_node(state: EdictState) -> EdictState:
     logger.info("【尚书省】开始协调六部执行")
     log_event_to_db(task_id, "node_start", "shangshu", "尚书省开始协调")
 
-    system_prompt = """你是尚书省尚书令，负责协调六部执行任务。
+    system_prompt = """你是尚书省尚书令，负责协调六部执行任务，并在执行后按文件产物进行阶段验收。
 
 根据计划内容，决定：
 1. 需要调用哪些部门（只调用确实需要的部门，不必所有部门都派活）
 2. 各部门的执行顺序：有依赖关系的放入不同阶段（stage），同一阶段内并行执行
+3. 每个任务必须尽量指向 work/ 下的具体交付物，避免空泛描述
+4. 尚书省必须先看真实文件产物再放行；若有写权限的部门未写文件，应由原部门返工，不得直接带过
 
 执行规则：
 - 若某部门的输出会影响另一个部门的工作（如户部的资源建议要传递给兵部），则户部放早期阶段，兵部放后续阶段
 - 兵部专门负责代码编写，工部负责部署，礼部负责文案——不要让它们互相越权
+- 吏部只负责组织治理，不承担虚拟环境创建、依赖安装、测试执行、部署验证
+- Python 虚拟环境、依赖安装、启动验证、部署脚本只能交给工部，不要派给吏部、户部或礼部
+- 业务代码、HTML/CSS/JS、接口实现只能交给兵部；礼部只负责文档与文案文件
 - 若任务不涉及某部门，直接不分配，不要编造无意义的任务
+- 如当前已经存在执行结果或门下省/上级给出“存疑”意见，本轮应优先安排补齐缺失产物的返工任务，而不是重新发散规划
 
 可用部门：吏部(libu_admin)、户部(hubu)、礼部(libu)、兵部(bingbu)、刑部(xingbu)、工部(gongbu)
 
@@ -931,7 +997,18 @@ def shangshu_node(state: EdictState) -> EdictState:
     user_content = (
         f"用户任务：\n{state['user_input']}\n\n"
         f"中书省计划：\n{state['plan']}\n\n"
-        f"门下省审核意见：\n{state['review_feedback']}"
+        f"门下省审核意见：\n{state['review_feedback']}\n\n"
+        f"门下省终验/尚书省返工意见：\n{state.get('delivery_review_feedback', '无')}\n\n"
+        f"现有部门执行结果：\n"
+        + (
+            "\n".join(
+                f"- {ROLE_DISPLAY_NAMES.get(k, k)}：状态={v.get('status', '?')}；"
+                f"文件={format_file_changes(v.get('file_changes', {}))}；"
+                f"摘要={v.get('output', '')[:240]}"
+                for k, v in state.get("ministry_results", {}).items()
+                if isinstance(v, dict)
+            ) or "暂无"
+        )
     )
 
     dispatch_result = call_llm_with_retry(system_prompt, user_content, role="shangshu")
@@ -946,6 +1023,7 @@ def shangshu_node(state: EdictState) -> EdictState:
         stages = [{"stage": 1, "description": "默认执行", "departments": [{"name": "兵部", "task": state["user_input"]}]}]
 
     ministry_results: Dict[str, Dict[str, Any]] = dict(state.get("ministry_results", {}))
+    all_dispatch_tasks: Dict[str, str] = {}
     _validate_task_id(task_id)
     task_dir = TASKS_DIR / task_id
     task_dir.mkdir(parents=True, exist_ok=True)
@@ -978,6 +1056,7 @@ def shangshu_node(state: EdictState) -> EdictState:
                 continue
             task_desc = m.get("task", "") + prior_outputs
             stage_dispatch[dept_key] = task_desc
+            all_dispatch_tasks[dept_key] = task_desc
 
         if not stage_dispatch:
             logger.warning(f"阶段 {stage_num} 无有效部门，跳过")
@@ -995,12 +1074,74 @@ def shangshu_node(state: EdictState) -> EdictState:
                 dept_name = ROLE_DISPLAY_NAMES.get(dept_key, dept_key)
                 try:
                     ministry_results[dept_key] = future.result()
-                    logger.info(f"  ✓ {dept_name} 完成（阶段 {stage_num}）")
+                    result_status = ministry_results[dept_key].get("status", "?")
+                    if result_status in {"error", "partial"}:
+                        logger.warning(f"  ! {dept_name} 阶段 {stage_num} 结果={result_status}")
+                    else:
+                        logger.info(f"  ✓ {dept_name} 完成（阶段 {stage_num}）")
                 except Exception as exc:
                     logger.error(f"  ✗ {dept_name} 执行异常：{exc}")
                     ministry_results[dept_key] = {
                         "output": str(exc), "status": "error",
                         "timestamp": datetime.now().isoformat()
+                    }
+
+    rework_summaries: list[str] = []
+    delivery_feedback = state.get("delivery_review_feedback", "")
+    for rework_round in range(1, MAX_SHANGSHU_REWORK_ROUNDS + 1):
+        rework_targets = {
+            dept_key: all_dispatch_tasks[dept_key]
+            for dept_key in all_dispatch_tasks
+            if should_rework_department(dept_key, ministry_results.get(dept_key))
+        }
+        if not rework_targets:
+            break
+
+        logger.warning(
+            f"尚书省文件复核未通过，第 {rework_round} 轮勒令返工：{list(rework_targets.keys())}"
+        )
+        log_event_to_db(
+            task_id,
+            "dispatch_rework",
+            "shangshu",
+            f"第 {rework_round} 轮返工：{','.join(rework_targets.keys())}",
+        )
+
+        rework_summaries.append(
+            f"第 {rework_round} 轮返工：{', '.join(ROLE_DISPLAY_NAMES.get(k, k) for k in rework_targets)}"
+        )
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(rework_targets)) as executor:
+            future_map = {
+                executor.submit(
+                    execute_ministry,
+                    dept_key,
+                    build_rework_task(
+                        dept_key,
+                        original_task,
+                        ministry_results.get(dept_key),
+                        delivery_feedback=delivery_feedback,
+                    ),
+                    state,
+                    logger,
+                    task_dir,
+                ): dept_key
+                for dept_key, original_task in rework_targets.items()
+            }
+            for future in concurrent.futures.as_completed(future_map):
+                dept_key = future_map[future]
+                dept_name = ROLE_DISPLAY_NAMES.get(dept_key, dept_key)
+                try:
+                    ministry_results[dept_key] = future.result()
+                    result_status = ministry_results[dept_key].get("status", "?")
+                    logger.info(f"  ↺ {dept_name} 返工完成，结果={result_status}")
+                except Exception as exc:
+                    logger.error(f"  ↺ {dept_name} 返工异常：{exc}")
+                    ministry_results[dept_key] = {
+                        "output": str(exc),
+                        "status": "error",
+                        "timestamp": datetime.now().isoformat(),
+                        "file_changes": {"created": [], "modified": [], "deleted": []},
                     }
 
     # M1: 用 LLM 语义分析决定需要哪些治理部门
@@ -1012,6 +1153,7 @@ def shangshu_node(state: EdictState) -> EdictState:
         task_id, "shangshu_dispatch.output",
         f"# 尚书省 派发日志\n时间：{datetime.now().isoformat()}\n{'='*60}\n\n"
         f"## 派发结果\n{dispatch_result}\n\n"
+        f"## 尚书省复核与返工\n{chr(10).join(rework_summaries) if rework_summaries else '无需返工'}\n\n"
         f"## 治理计划\n{json.dumps(governance_plan, ensure_ascii=False, indent=2)}\n"
     )
 
@@ -1021,6 +1163,7 @@ def shangshu_node(state: EdictState) -> EdictState:
     return {
         "ministry_results": ministry_results,
         "governance_plan": governance_plan,
+        "dispatch_revision_count": state.get("dispatch_revision_count", 0) + 1,
         "updated_at": datetime.now().isoformat()
     }
 
@@ -1216,6 +1359,14 @@ def menxia_final_node(state: EdictState) -> EdictState:
         logger.warning(f"门下省终验调用失败，跳过：{e}")
         review = '{"verdict": "通过", "summary": "终验跳过（LLM 调用失败）", "issues": []}'
 
+    parsed_review = extract_json_from_output(review) or {}
+    verdict = str(parsed_review.get("verdict", "")).strip()
+    if any(keyword in verdict for keyword in ["存疑", "不通过", "驳回"]):
+        delivery_review_status = "rejected"
+    else:
+        delivery_review_status = "approved"
+
+    feedback_text = review
     log_event_to_db(task_id, "node_complete", "menxia_final", f"终验完成：{review[:200]}")
     logger.info(f"门下省终验结果：{review[:200]}")
 
@@ -1224,7 +1375,11 @@ def menxia_final_node(state: EdictState) -> EdictState:
         f"# 门下省·终验 执行日志\n时间：{datetime.now().isoformat()}\n{'='*60}\n\n{review}\n"
     )
 
-    return {"updated_at": datetime.now().isoformat()}
+    return {
+        "delivery_review_status": delivery_review_status,
+        "delivery_review_feedback": feedback_text,
+        "updated_at": datetime.now().isoformat(),
+    }
 
 
 def finalize_node(state: EdictState) -> EdictState:
@@ -1330,6 +1485,34 @@ def after_review_route(state: EdictState) -> Literal["zhongshu_node", "shangshu_
     return END
 
 
+def after_final_review_route(state: EdictState) -> Literal["shangshu_node", "finalize_node"]:
+    """门下省终验后的路由：存疑则回尚书省整改，通过则汇总。"""
+    task_id = state.get("task_id", "unknown")
+    logger = setup_logger(task_id)
+    delivery_status = state.get("delivery_review_status", "approved")
+    dispatch_round = state.get("dispatch_revision_count", 0)
+
+    if delivery_status == "rejected":
+        if dispatch_round >= MAX_DELIVERY_REVISIONS:
+            logger.warning(
+                f"门下省终验仍存疑，但尚书省整改已达上限 ({MAX_DELIVERY_REVISIONS})，转入最终汇总"
+            )
+            log_event_to_db(
+                task_id,
+                "routing",
+                "menxia_final",
+                f"终验存疑但整改达上限 {MAX_DELIVERY_REVISIONS}，转入汇总",
+            )
+            return "finalize_node"
+        logger.warning("门下省终验存疑，回流尚书省继续整改")
+        log_event_to_db(task_id, "routing", "menxia_final", "终验存疑，回流尚书省整改")
+        return "shangshu_node"
+
+    logger.info("门下省终验通过，进入最终汇总")
+    log_event_to_db(task_id, "routing", "menxia_final", "终验通过，进入汇总")
+    return "finalize_node"
+
+
 def should_run_governance(state: EdictState) -> Literal["libu_admin_node", "hubu_node", "xingbu_node", "menxia_final_node"]:
     """
     根据尚书省生成的 governance_plan（LLM 语义分析结果，M1）决定首个治理节点。
@@ -1431,7 +1614,14 @@ def create_edict_workflow():
         }
     )
 
-    workflow.add_edge("menxia_final_node", "finalize_node")   # L1
+    workflow.add_conditional_edges(
+        "menxia_final_node",
+        after_final_review_route,
+        {
+            "shangshu_node": "shangshu_node",
+            "finalize_node": "finalize_node",
+        }
+    )
     workflow.add_edge("finalize_node", END)
 
     # 编译（带内存检查点，支持状态恢复）
@@ -1475,6 +1665,9 @@ def run_langgraph_workflow(user_input: str, task_id: Optional[str] = None):
         "governance_plan": {},
         "priority": "P3",
         "final_output": "",
+        "dispatch_revision_count": 0,
+        "delivery_review_status": "pending",
+        "delivery_review_feedback": "",
         "created_at": datetime.now().isoformat(),
         "updated_at": datetime.now().isoformat()
     }
