@@ -2,13 +2,13 @@
 # 安装命令：pip install -r requirements.txt
 
 # LangGraph 核心
-langgraph>=1.0.0
-langgraph-checkpoint>=2.1.0
+langgraph>=1.1.4
+langgraph-checkpoint>=4.0.1
 
 # LangChain 核心与 Agent 运行时
-langchain==0.3.25
-langchain-core==0.3.83
-langchain-openai==0.3.35
+langchain>=1.2.14
+langchain-core>=1.2.24
+langchain-openai>=1.1.12
 
 # 其他依赖（自动安装）
 # - pydantic>=2.7.4

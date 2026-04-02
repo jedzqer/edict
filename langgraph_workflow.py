@@ -433,10 +433,14 @@ def execute_ministry(ministry_key: str, task_desc: str, state: "EdictState",
 
         llm = _get_llm_for_role(ministry_key)
 
-        # LangChain 0.3.x 环境中未提供 create_agent；使用 LangGraph 预构建 agent
-        # 以保持现有 messages/state 风格与流式输出逻辑兼容。
-        from langgraph.prebuilt import create_react_agent
-        agent = create_react_agent(llm, tools=tools, prompt=role_prompt)
+        # 优先使用 LangChain 1.x 的 create_agent，避免依赖已弃用的
+        # langgraph.prebuilt.create_react_agent；旧环境下再回退。
+        try:
+            from langchain.agents import create_agent
+            agent = create_agent(llm, tools=tools, system_prompt=role_prompt)
+        except ImportError:
+            from langgraph.prebuilt import create_react_agent
+            agent = create_react_agent(llm, tools=tools, prompt=role_prompt)
 
         def _stream_to_file(agent_obj) -> str:
             """流式执行并实时写入输出文件，返回最终输出文本"""
