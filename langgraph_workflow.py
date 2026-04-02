@@ -82,6 +82,132 @@ def format_file_changes(changes: Dict[str, list[str]]) -> str:
     return "\n".join(lines) if lines else "无文件变更。"
 
 
+def sample_work_file_contents(limit_files: int = 8, max_chars_per_file: int = 1200) -> str:
+    """采样 work/ 中的关键文件内容，供终验节点基于真实产物判断。"""
+    if not WORK_DIR.exists():
+        return "work/ 目录不存在。"
+
+    preferred_suffixes = [
+        ".md", ".txt", ".py", ".html", ".css", ".js", ".json",
+        ".yml", ".yaml", ".toml", ".ini", ".sh"
+    ]
+    preferred_paths: list[Path] = []
+    fallback_paths: list[Path] = []
+
+    for path in sorted(WORK_DIR.rglob("*")):
+        if not path.is_file():
+            continue
+        rel = path.relative_to(WORK_DIR).as_posix()
+        if any(part.startswith(".") for part in path.relative_to(WORK_DIR).parts):
+            continue
+        if path.suffix.lower() in preferred_suffixes:
+            preferred_paths.append(path)
+        else:
+            fallback_paths.append(path)
+
+    selected = (preferred_paths + fallback_paths)[:limit_files]
+    if not selected:
+        return "work/ 目录当前无可读取文件。"
+
+    samples: list[str] = []
+    for path in selected:
+        rel = path.relative_to(WORK_DIR).as_posix()
+        try:
+            content = path.read_text(encoding="utf-8", errors="replace")
+        except Exception as e:
+            samples.append(f"## {rel}\n[读取失败] {e}")
+            continue
+
+        snippet = content[:max_chars_per_file]
+        if len(content) > max_chars_per_file:
+            snippet += "\n... [内容已截断]"
+        samples.append(f"## {rel}\n{snippet}")
+
+    return "\n\n".join(samples)
+
+
+def extract_work_paths(text: str) -> list[str]:
+    """从任务描述中提取 work/ 下的目标路径。"""
+    if not text:
+        return []
+    matches = re.findall(r"work/[A-Za-z0-9_\-./<>一-龥]+", text)
+    seen: set[str] = set()
+    paths: list[str] = []
+    for match in matches:
+        cleaned = match.rstrip("，。；：,.;:）)]}>")
+        if cleaned not in seen:
+            seen.add(cleaned)
+            paths.append(cleaned)
+    return paths
+
+
+def infer_project_root(text: str) -> Optional[str]:
+    """从计划或任务文本中推断统一项目根目录，如 work/my-app。"""
+    paths = extract_work_paths(text)
+    candidates = [p for p in paths if p.count("/") >= 1]
+    for candidate in candidates:
+        parts = candidate.split("/")
+        if len(parts) >= 2 and parts[1] and "<项目名>" not in candidate:
+            return "/".join(parts[:2])
+    return None
+
+
+def normalize_dispatch_department(task_desc: str, dept_key: str) -> str:
+    """基于任务语义强制收敛到正确部门，避免尚书省派工越权。"""
+    text = task_desc.lower()
+    frontend_markers = [
+        ".html", ".css", ".js", "前端", "页面", "样式", "组件", "交互", "浏览器", "静态资源",
+        "canvas", "game.js", "index.html", "ui", "ux"
+    ]
+    backend_markers = [
+        ".py", "后端", "flask", "fastapi", "api", "接口", "服务", "数据库", "持久化",
+        "server.py", "app.py", "json存储", "sqlite"
+    ]
+    doc_markers = [
+        "readme", ".md", "文档", "说明", "部署文档", "接口文档", "用户手册", "说明文案"
+    ]
+    ops_markers = [
+        "requirements.txt", "虚拟环境", "依赖安装", "pip install", "npm install", "启动服务",
+        "运行验证", "构建", "部署", "部署脚本", "静态文件路由"
+    ]
+
+    if any(marker in text for marker in doc_markers):
+        return "libu"
+    if any(marker in text for marker in ops_markers):
+        return "gongbu"
+    if any(marker in text for marker in frontend_markers):
+        return "gongbu"
+    if any(marker in text for marker in backend_markers):
+        return "bingbu"
+    return dept_key
+
+
+def normalize_stage_plan(stages: list[dict], logger: logging.Logger) -> list[dict]:
+    """对尚书省派工结果做代码级纠偏，修正明显越权映射。"""
+    normalized_stages: list[dict] = []
+    for stage_info in stages:
+        stage_copy = dict(stage_info)
+        normalized_departments: list[dict] = []
+        for dept in stage_info.get("departments", []):
+            dept_copy = dict(dept)
+            original_name = str(dept_copy.get("name", ""))
+            original_key = normalize_department(original_name) or original_name
+            task_desc = str(dept_copy.get("task", ""))
+            normalized_key = normalize_dispatch_department(task_desc, original_key)
+            if normalized_key != original_key:
+                logger.warning(
+                    "尚书省派工纠偏：%s -> %s，任务=%s",
+                    original_key,
+                    normalized_key,
+                    task_desc[:120],
+                )
+                dept_copy["name"] = ROLE_DISPLAY_NAMES.get(normalized_key, normalized_key)
+            normalized_departments.append(dept_copy)
+        stage_copy["departments"] = normalized_departments
+        normalized_stages.append(stage_copy)
+    return normalized_stages
+
+
 @tool
 def read_file(file_path: str) -> str:
     """Read a file from the work directory."""
@@ -726,6 +852,8 @@ def build_rework_task(
 ) -> str:
     """生成尚书省返工指令。"""
     reasons: list[str] = []
+    expected_paths = extract_work_paths(original_task)
+    project_root = infer_project_root(original_task)
     if not isinstance(result, dict):
         reasons.append("系统未拿到有效执行结果。")
     else:
@@ -742,10 +870,20 @@ def build_rework_task(
         "\n\n【尚书省复核结论】\n"
         + "\n".join(f"- {reason}" for reason in reasons)
         + "\n\n【返工要求】\n"
-        "- 本轮必须把结果真实写入 work/，不能只做文字说明。\n"
-        "- 不得先写探测脚本、目录巡检脚本或与目标无关的辅助文件代替正式交付。\n"
-        "- 若你具备 write_file 权限，则至少产出与任务直接相关的目标文件。\n"
-        "- 若仍无法完成，必须明确说明阻塞原因，并指出缺失的具体文件或前置产物。"
+        + "- 本轮必须把结果真实写入 work/，不能只做文字说明。\n"
+        + "- 不得先写探测脚本、目录巡检脚本或与目标无关的辅助文件代替正式交付。\n"
+        + (
+            f"- 本轮统一项目根目录按 `{project_root}` 执行，不得再写回 work/ 根目录。\n"
+            if project_root else ""
+        )
+        + (
+            "- 本轮必须至少补齐这些目标文件："
+            + ", ".join(f"`{path}`" for path in expected_paths[:8])
+            + "。\n"
+            if expected_paths else
+            "- 若你具备 write_file 权限，则至少产出与任务直接相关的目标文件。\n"
+        )
+        + "- 若仍无法完成，必须明确说明阻塞原因，并指出缺失的具体文件或前置产物。"
     )
     return f"{original_task}{rework_rules}"
 
@@ -775,19 +913,33 @@ def zhongshu_node(state: EdictState) -> EdictState:
     system_prompt = """你是中书省令，负责项目结构设计。
 请根据用户输入，生成项目的详细结构设计和实施步骤，不需要分配部门，部门分配将由尚书省完成。
 
+强制要求：
+1. 先确定统一项目根目录，必须写成 `work/<项目名>`，不得默认把产物散落到 `work/` 根目录
+2. `project_root` 必须是具体路径，例如 `work/climb-game`
+3. 所有交付物路径、目录结构、预期文件，都必须尽量写成 `work/<项目名>/...`
+4. 前端、后端、文档、部署等产物路径要分开写清，便于尚书省后续派工
+
 计划必须使用以下 JSON 格式输出：
 ```json
 {
     "task_name": "任务名称",
     "description": "任务描述",
-    "project_structure": "项目的整体架构和目录结构设计",
+    "project_root": "work/<项目名>",
+    "project_structure": {
+        "root": "work/<项目名>",
+        "directories": ["work/<项目名>/frontend", "work/<项目名>/backend"],
+        "key_files": ["work/<项目名>/README.md", "work/<项目名>/backend/app.py"]
+    },
     "implementation_steps": [
-        "步骤1：...",
-        "步骤2：...",
-        "步骤3：..."
+        {
+            "step": "步骤1名称",
+            "goal": "该步骤的目标",
+            "expected_outputs": ["work/<项目名>/..."],
+            "notes": "依赖、接口或验收要点"
+        }
     ],
     "timeline": "预期时间线",
-    "resources": "所需资源"
+    "resources": ["所需资源1", "所需资源2"]
 }
 ```"""
 
@@ -957,15 +1109,18 @@ def shangshu_node(state: EdictState) -> EdictState:
 根据计划内容，决定：
 1. 需要调用哪些部门（只调用确实需要的部门，不必所有部门都派活）
 2. 各部门的执行顺序：有依赖关系的放入不同阶段（stage），同一阶段内并行执行
-3. 每个任务必须尽量指向 work/ 下的具体交付物，避免空泛描述
+3. 每个任务必须尽量指向 work/<项目名>/ 下的具体交付物，避免空泛描述
 4. 尚书省必须先看真实文件产物再放行；若有写权限的部门未写文件，应由原部门返工，不得直接带过
 
 执行规则：
 - 若某部门的输出会影响另一个部门的工作（如户部的资源建议要传递给兵部），则户部放早期阶段，兵部放后续阶段
-- 兵部专门负责代码编写，工部负责部署，礼部负责文案——不要让它们互相越权
+- 派工前必须先从计划中确认统一项目根目录，并在任务描述里显式写出 `work/<项目名>/...` 目标路径
+- 兵部负责后端代码与服务逻辑；工部负责前端页面、HTML/CSS/JS、构建、依赖安装、启动验证与部署；礼部负责 README、说明文档、接口文档与文案
 - 吏部只负责组织治理，不承担虚拟环境创建、依赖安装、测试执行、部署验证
 - Python 虚拟环境、依赖安装、启动验证、部署脚本只能交给工部，不要派给吏部、户部或礼部
-- 业务代码、HTML/CSS/JS、接口实现只能交给兵部；礼部只负责文档与文案文件
+- HTML/CSS/JS、前端页面、动画和浏览器交互只能交给工部，不要派给兵部
+- 后端 Python、API、服务逻辑、数据持久化只能交给兵部，不要派给工部
+- README、说明文档、接口文档只能交给礼部，不要派给兵部或工部
 - 若任务不涉及某部门，直接不分配，不要编造无意义的任务
 - 如当前已经存在执行结果或门下省/上级给出“存疑”意见，本轮应优先安排补齐缺失产物的返工任务，而不是重新发散规划
 
@@ -1021,6 +1176,8 @@ def shangshu_node(state: EdictState) -> EdictState:
     if not stages:
         logger.warning("未解析到分阶段方案，回退到单阶段兵部任务")
         stages = [{"stage": 1, "description": "默认执行", "departments": [{"name": "兵部", "task": state["user_input"]}]}]
+    else:
+        stages = normalize_stage_plan(stages, logger)
 
     ministry_results: Dict[str, Dict[str, Any]] = dict(state.get("ministry_results", {}))
     all_dispatch_tasks: Dict[str, str] = {}
@@ -1334,6 +1491,7 @@ def menxia_final_node(state: EdictState) -> EdictState:
         for k, v in state.get("ministry_results", {}).items()
     )
     current_workspace = format_work_tree(snapshot_work_tree())
+    workspace_samples = sample_work_file_contents()
 
     system_prompt = """你是门下省侍中，负责对六部执行成果进行最终质量验收。
 
@@ -1342,6 +1500,7 @@ def menxia_final_node(state: EdictState) -> EdictState:
 2. 整体方案是否满足用户原始需求
 3. 是否存在安全或合规遗漏
 4. 对于代码、文档、部署类任务，必须优先依据真实文件产物判断，不能仅依据部门自述
+5. 若已提供 work/ 关键文件内容摘录，必须优先阅读这些摘录，再结合文件清单与部门结果作出判断
 
 输出 JSON：
 {"verdict": "通过" 或 "存疑", "summary": "验收意见", "issues": ["问题1（如无则为空列表）"]}"""
@@ -1350,7 +1509,8 @@ def menxia_final_node(state: EdictState) -> EdictState:
         f"用户原始任务：{state['user_input']}\n\n"
         f"计划：{state['plan'][:500]}\n\n"
         f"各部门执行结果：\n{results_summary}\n\n"
-        f"当前 work/ 文件清单：\n{current_workspace}"
+        f"当前 work/ 文件清单：\n{current_workspace}\n\n"
+        f"当前 work/ 关键文件内容摘录：\n{workspace_samples}"
     )
 
     try:
@@ -1372,7 +1532,10 @@ def menxia_final_node(state: EdictState) -> EdictState:
 
     write_node_output(
         task_id, "menxia_final.output",
-        f"# 门下省·终验 执行日志\n时间：{datetime.now().isoformat()}\n{'='*60}\n\n{review}\n"
+        f"# 门下省·终验 执行日志\n时间：{datetime.now().isoformat()}\n{'='*60}\n\n"
+        f"## work/ 文件清单\n{current_workspace}\n\n"
+        f"## work/ 关键文件内容摘录\n{workspace_samples}\n\n"
+        f"## 终验结论\n{review}\n"
     )
 
     return {
