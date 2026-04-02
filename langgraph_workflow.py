@@ -16,6 +16,7 @@ import os
 import re
 import sqlite3
 import logging
+import time
 import threading
 import concurrent.futures
 from pathlib import Path
@@ -141,6 +142,88 @@ def extract_work_paths(text: str) -> list[str]:
     return paths
 
 
+def normalize_workspace_relpath(file_path: str) -> str:
+    """将任务中出现的路径归一化为相对 work/ 根目录的安全路径。"""
+    normalized = re.sub(r"^(?:\.?/)?work/", "", (file_path or "").strip())
+    normalized = normalized.lstrip("/")
+    normalized = re.sub(r"/{2,}", "/", normalized)
+    if normalized in {"", ".", ".."}:
+        raise ValueError("empty workspace path")
+    if any(part == ".." for part in Path(normalized).parts):
+        raise ValueError(f"unsafe workspace path: {file_path}")
+    return normalized
+
+
+def resolve_workspace_path(file_path: str) -> Path:
+    """把任务路径映射到 work/ 目录下的真实路径。"""
+    normalized = normalize_workspace_relpath(file_path)
+    path = WORK_DIR / normalized
+    resolved = path.resolve()
+    if not str(resolved).startswith(str(WORK_DIR.resolve())):
+        raise ValueError(f"workspace path escapes work/: {file_path}")
+    return resolved
+
+
+def rewrite_task_paths_for_workspace(text: str) -> str:
+    """把任务中的 work/... 路径重写为相对 backend 根目录的路径，避免生成 work/work。"""
+    if not text:
+        return text
+
+    seen: set[str] = set()
+
+    def repl(match: re.Match[str]) -> str:
+        raw = match.group(0)
+        if raw in seen:
+            return raw
+        seen.add(raw)
+        try:
+            return normalize_workspace_relpath(raw)
+        except ValueError:
+            return raw
+
+    return re.sub(r"work/[A-Za-z0-9_\-./<>一-龥]+", repl, text)
+
+
+def is_rate_limit_error(text: str) -> bool:
+    """粗略识别限流错误，便于退避和降级。"""
+    lowered = (text or "").lower()
+    markers = ["429", "rate limit", "rate_limit", "tpm limit", "too many requests"]
+    return any(marker in lowered for marker in markers)
+
+
+def repair_mirrored_workspace_paths() -> list[str]:
+    """修复被错误写到 work/<abs-workspace-path>/... 下的镜像文件。"""
+    moved: list[str] = []
+    workspace_prefix = WORK_DIR.resolve().as_posix().lstrip("/") + "/"
+
+    for path in sorted(WORK_DIR.rglob("*")):
+        if not path.is_file():
+            continue
+        rel = path.relative_to(WORK_DIR).as_posix()
+        if not rel.startswith(workspace_prefix):
+            continue
+
+        suffix = rel[len(workspace_prefix):]
+        if not suffix:
+            continue
+
+        target = resolve_workspace_path(suffix)
+        if target == path:
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        path.replace(target)
+        moved.append(f"{rel} -> {suffix}")
+
+    # 清理因镜像写入残留的空目录
+    for path in sorted(WORK_DIR.rglob("*"), reverse=True):
+        if path.is_dir():
+            try:
+                path.rmdir()
+            except OSError:
+                pass
+    return moved
+
+
 def infer_project_root(text: str) -> Optional[str]:
     """从计划或任务文本中推断统一项目根目录，如 work/my-app。"""
     paths = extract_work_paths(text)
@@ -153,8 +236,9 @@ def infer_project_root(text: str) -> Optional[str]:
 
 
 def normalize_dispatch_department(task_desc: str, dept_key: str) -> str:
-    """保守纠偏派工：仅在出现非常明确的前后端/文档越权时才改派。"""
+    """保守纠偏派工：仅在出现非常明确的前后端/文档/部署越权时才改派。"""
     text = task_desc.lower()
+    task_paths = [path.lower() for path in extract_work_paths(task_desc)]
 
     # 这些部门不应被关键词纠偏，避免把资源治理/安全审计/组织治理误改派。
     if dept_key in {"hubu", "xingbu", "libu_admin"}:
@@ -175,22 +259,37 @@ def normalize_dispatch_department(task_desc: str, dept_key: str) -> str:
     doc_markers = [
         "readme", "文档", "接口文档", "部署文档", "用户手册", "说明文案", "操作说明", "使用说明"
     ]
+    deploy_markers = [
+        "deploy", "start.sh", "docker", "compose", "nginx", "启动脚本", "部署", "构建", "发布", "回滚", "运维"
+    ]
 
     has_frontend = any(marker in text for marker in frontend_markers)
     has_backend = any(marker in text for marker in backend_markers)
     has_docs = any(marker in text for marker in doc_markers)
+    has_deploy = any(marker in text for marker in deploy_markers)
+    docs_only_paths = bool(task_paths) and all(
+        "/docs/" in path or path.endswith("/readme.md") or path.endswith("readme.md")
+        for path in task_paths
+    )
 
-    # 只修正明确的职责冲突，不根据模糊词（如“说明”“启动服务”“数据库”）跨部门改派。
-    if dept_key == "bingbu" and has_frontend and not has_backend:
-        return "gongbu"
-    if dept_key == "gongbu" and has_backend and not has_frontend:
+    # 只修正明确的职责冲突，不根据模糊词跨部门改派。
+    # 当前制度下：兵部负责代码实现（前后端），礼部负责文档，工部负责部署与验证。
+    if docs_only_paths:
+        return "libu"
+    if dept_key == "gongbu" and (has_frontend or has_backend) and not has_deploy:
         return "bingbu"
-    if dept_key in {"bingbu", "gongbu"} and has_docs and not has_frontend and not has_backend:
+    if dept_key == "bingbu" and has_deploy and not has_frontend and not has_backend:
+        return "gongbu"
+    if dept_key in {"bingbu", "gongbu"} and has_docs and not has_frontend and not has_backend and not has_deploy:
         return "libu"
     if dept_key == "libu" and has_backend and not has_docs:
         return "bingbu"
     if dept_key == "libu" and has_frontend and not has_docs:
+        return "bingbu"
+    if dept_key == "libu" and has_deploy and not has_docs:
         return "gongbu"
+    if dept_key == "gongbu" and has_docs and not has_deploy and not has_frontend and not has_backend:
+        return "libu"
     return dept_key
 
 
@@ -362,9 +461,7 @@ def allow_parallel_frontend_backend(
 def read_file(file_path: str) -> str:
     """Read a file from the work directory."""
     try:
-        normalized = re.sub(r"^(?:\.?/)?work/", "", file_path.strip())
-        path = WORK_DIR / normalized
-        if not str(path.resolve()).startswith(str(WORK_DIR.resolve())): return "Error: Access denied."
+        path = resolve_workspace_path(file_path)
         with open(path, 'r', encoding='utf-8') as f:
             return f.read()
     except Exception as e:
@@ -374,9 +471,8 @@ def read_file(file_path: str) -> str:
 def write_file(file_path: str, content: str) -> str:
     """Write text content to a file in the work directory."""
     try:
-        normalized = re.sub(r"^(?:\.?/)?work/", "", file_path.strip())
-        path = WORK_DIR / normalized
-        if not str(path.resolve()).startswith(str(WORK_DIR.resolve())): return "Error: Access denied."
+        normalized = normalize_workspace_relpath(file_path)
+        path = resolve_workspace_path(file_path)
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, 'w', encoding='utf-8') as f:
             f.write(content)
@@ -437,11 +533,11 @@ def _create_ministry_agent(ministry_key: str, llm: "ChatOpenAI", role_prompt: st
         from deepagents.backends.filesystem import FilesystemBackend
         from deepagents.backends.local_shell import LocalShellBackend
 
-        backend = FilesystemBackend(root_dir=WORK_DIR, virtual_mode=True)
+        backend = FilesystemBackend(root_dir=WORK_DIR, virtual_mode=False)
         if ministry_key == "gongbu":
             backend = LocalShellBackend(
                 root_dir=WORK_DIR,
-                virtual_mode=True,
+                virtual_mode=False,
                 timeout=30,
                 inherit_env=True,
             )
@@ -452,8 +548,9 @@ def _create_ministry_agent(ministry_key: str, llm: "ChatOpenAI", role_prompt: st
             "硬约束：\n"
             "1. 真实产物优先，结果应尽量落到 work/ 目录，而不是停留在文字说明。\n"
             "2. 如任务较复杂，主动使用 write_todos 拆解，再视情况使用 task 委派子代理。\n"
-            "3. 文件路径一律按当前 backend 根目录处理；不要尝试访问 work/ 之外的路径。\n"
-            "4. 若需要执行命令，只做与当前任务直接相关的最小验证。\n"
+            "3. 当前 backend 的工作根目录就是 work/；优先使用相对路径如 `climb-game/README.md`。\n"
+            "4. 严禁把绝对路径或 `work/...` 再拼成 `work/home/...`、`work/work/...` 这类镜像路径。\n"
+            "5. 若需要执行命令，只做与当前任务直接相关的最小验证。\n"
         )
         return create_deep_agent(
             model=llm,
@@ -481,6 +578,9 @@ def execute_ministry(ministry_key: str, task_desc: str, state: "EdictState",
 
     try:
         role_prompt = load_role_prompt(ministry_key)
+        pre_repaired_paths = repair_mirrored_workspace_paths()
+        if pre_repaired_paths:
+            logger.warning(f"{ministry_name} 执行前修复镜像路径：{pre_repaired_paths}")
         before_snapshot = snapshot_work_tree()
         prior_results = state.get("ministry_results", {})
         prior_artifacts = []
@@ -493,9 +593,13 @@ def execute_ministry(ministry_key: str, task_desc: str, state: "EdictState",
                     f"- {ROLE_DISPLAY_NAMES.get(dept_key, dept_key)}\n"
                     f"{format_file_changes(changes)}"
                 )
+        backend_task_desc = rewrite_task_paths_for_workspace(task_desc)
         context = (
             f"用户请求：{state['user_input']}\n\n"
             f"工作流指定你的任务是：{task_desc}\n\n"
+            f"当前 backend 根目录就是 work/。\n"
+            f"路径换算规则：任务中若写 `work/...`，你实际操作时必须写成相对路径 `...`，"
+            f"按 backend 根目录重写后的任务路径：{backend_task_desc}\n\n"
             f"当前 work/ 文件清单：\n{format_work_tree(before_snapshot)}\n\n"
             f"前序部门已落盘的文件变更：\n"
             f"{chr(10).join(prior_artifacts) if prior_artifacts else '暂无前序文件产物。'}\n\n"
@@ -513,16 +617,38 @@ def execute_ministry(ministry_key: str, task_desc: str, state: "EdictState",
         llm = _get_llm_for_role(ministry_key)
         agent = _create_ministry_agent(ministry_key, llm, role_prompt, tools)
 
+        def _extract_agent_output(res: Any) -> str:
+            """兼容多种 agent 返回结构，避免 KeyError('output')。"""
+            if res is None:
+                return ""
+            if isinstance(res, str):
+                return res
+            if isinstance(res, dict):
+                messages = res.get("messages")
+                if isinstance(messages, list) and messages:
+                    last = messages[-1]
+                    content = getattr(last, "content", "")
+                    if isinstance(content, list):
+                        return "\n".join(str(item) for item in content)
+                    if content:
+                        return str(content)
+                for key in ["output", "result", "final_output", "text", "content"]:
+                    value = res.get(key)
+                    if value:
+                        return str(value)
+                return json.dumps(res, ensure_ascii=False, default=str)
+            return str(res)
+
         def _stream_to_file(agent_obj) -> str:
             """流式执行并实时写入输出文件，返回最终输出文本"""
             if output_file is None:
                 # 无文件目标，直接 invoke
                 try:
                     res = agent_obj.invoke({"messages": [("user", context)]})
-                    return res["messages"][-1].content
+                    return _extract_agent_output(res)
                 except Exception:
                     res = agent_obj.invoke({"input": context})
-                    return res["output"]
+                    return _extract_agent_output(res)
 
             output_file.parent.mkdir(parents=True, exist_ok=True)
             parts: list[str] = []
@@ -567,10 +693,10 @@ def execute_ministry(ministry_key: str, task_desc: str, state: "EdictState",
                     parts = []
                     try:
                         res = agent_obj.invoke({"messages": [("user", context)]})
-                        fallback_output = res["messages"][-1].content
+                        fallback_output = _extract_agent_output(res)
                     except Exception:
                         res = agent_obj.invoke({"input": context})
-                        fallback_output = res["output"]
+                        fallback_output = _extract_agent_output(res)
                     f.write(fallback_output)
                     f.flush()
                     parts = [fallback_output]
@@ -588,6 +714,9 @@ def execute_ministry(ministry_key: str, task_desc: str, state: "EdictState",
             return parts[-1]
 
         output = _stream_to_file(agent)
+        repaired_paths = repair_mirrored_workspace_paths()
+        if repaired_paths:
+            logger.warning(f"{ministry_name} 执行后修复镜像路径：{repaired_paths}")
         after_snapshot = snapshot_work_tree()
         file_changes = diff_work_tree(before_snapshot, after_snapshot)
         artifact_status = "success"
@@ -600,6 +729,10 @@ def execute_ministry(ministry_key: str, task_desc: str, state: "EdictState",
 
         if output_file:
             with open(str(output_file), "a", encoding="utf-8") as f:
+                if repaired_paths:
+                    f.write("\n## 镜像路径修复\n")
+                    f.write("\n".join(f"- {item}" for item in repaired_paths))
+                    f.write("\n")
                 f.write("\n## 文件变更\n")
                 f.write(format_file_changes(file_changes))
                 f.write("\n\n## 执行后文件清单\n")
@@ -1029,10 +1162,13 @@ def call_llm_with_retry(system_prompt: str, user_content: str,
             raise
         except Exception as e:
             last_error = e
+            err_text = str(e)
             global_logger.warning(f"LLM 调用失败（第 {attempt}/{max_retries} 次，角色={role}）：{e}")
             if attempt < max_retries:
-                import time
-                time.sleep(2 ** attempt)
+                delay = 2 ** attempt
+                if is_rate_limit_error(err_text):
+                    delay = max(delay, 8 * attempt)
+                time.sleep(delay)
 
     global_logger.error(f"LLM 调用失败，已重试 {max_retries} 次（角色={role}）：{last_error}")
     raise EdictExecutionError(f"LLM 调用失败（角色={role}）：{last_error}") from last_error
@@ -1066,6 +1202,15 @@ def should_rework_department(dept_key: str, result: Optional[Dict[str, Any]]) ->
         return True
     if dept_key in WRITE_REQUIRED_DEPARTMENTS and not has_file_changes(result):
         return True
+    return False
+
+
+def rework_needs_serial_execution(results: Dict[str, Dict[str, Any]], targets: Dict[str, str]) -> bool:
+    """若返工目标里已有明显限流错误，则改为串行返工，降低再次撞上 TPM 的概率。"""
+    for dept_key in targets:
+        result = results.get(dept_key)
+        if isinstance(result, dict) and is_rate_limit_error(str(result.get("output", ""))):
+            return True
     return False
 
 
@@ -1510,7 +1655,13 @@ def shangshu_node(state: EdictState) -> EdictState:
             f"第 {rework_round} 轮返工：{', '.join(ROLE_DISPLAY_NAMES.get(k, k) for k in rework_targets)}"
         )
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=len(rework_targets)) as executor:
+        serial_rework = rework_needs_serial_execution(ministry_results, rework_targets)
+        max_workers = 1 if serial_rework else len(rework_targets)
+        if serial_rework:
+            logger.warning("检测到返工目标包含限流错误，本轮改为串行返工并增加退避。")
+            time.sleep(6 * rework_round)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             state_for_rework = dict(state)
             state_for_rework["ministry_results"] = dict(ministry_results)
             future_map = {
