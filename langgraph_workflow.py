@@ -32,11 +32,62 @@ import subprocess
 from langchain_core.tools import tool
 
 
+def snapshot_work_tree() -> Dict[str, Dict[str, Any]]:
+    """返回 work/ 目录当前文件快照，用于部门间基于真实产物协作。"""
+    snapshot: Dict[str, Dict[str, Any]] = {}
+    for path in sorted(WORK_DIR.rglob("*")):
+        if not path.is_file():
+            continue
+        rel = path.relative_to(WORK_DIR).as_posix()
+        stat = path.stat()
+        snapshot[rel] = {
+            "size": stat.st_size,
+            "mtime": int(stat.st_mtime),
+        }
+    return snapshot
+
+
+def diff_work_tree(before: Dict[str, Dict[str, Any]],
+                   after: Dict[str, Dict[str, Any]]) -> Dict[str, list[str]]:
+    """比较前后快照，提取新增、修改、删除文件。"""
+    created = sorted([p for p in after if p not in before])
+    deleted = sorted([p for p in before if p not in after])
+    modified = sorted([
+        p for p in after
+        if p in before and after[p] != before[p]
+    ])
+    return {"created": created, "modified": modified, "deleted": deleted}
+
+
+def format_work_tree(snapshot: Dict[str, Dict[str, Any]], limit: int = 40) -> str:
+    """将 work/ 文件清单格式化为紧凑文本。"""
+    if not snapshot:
+        return "work/ 目录当前为空。"
+    items = []
+    for idx, (path, meta) in enumerate(snapshot.items()):
+        if idx >= limit:
+            items.append(f"... 共 {len(snapshot)} 个文件")
+            break
+        items.append(f"- {path} ({meta['size']} bytes)")
+    return "\n".join(items)
+
+
+def format_file_changes(changes: Dict[str, list[str]]) -> str:
+    """将文件变更摘要格式化为文本。"""
+    lines: list[str] = []
+    for key, title in [("created", "新增"), ("modified", "修改"), ("deleted", "删除")]:
+        files = changes.get(key, [])
+        if files:
+            lines.append(f"{title}：{', '.join(files)}")
+    return "\n".join(lines) if lines else "无文件变更。"
+
+
 @tool
 def read_file(file_path: str) -> str:
     """Read a file from the work directory."""
     try:
-        path = WORK_DIR / file_path
+        normalized = re.sub(r"^(?:\.?/)?work/", "", file_path.strip())
+        path = WORK_DIR / normalized
         if not str(path.resolve()).startswith(str(WORK_DIR.resolve())): return "Error: Access denied."
         with open(path, 'r', encoding='utf-8') as f:
             return f.read()
@@ -47,12 +98,13 @@ def read_file(file_path: str) -> str:
 def write_file(file_path: str, content: str) -> str:
     """Write text content to a file in the work directory."""
     try:
-        path = WORK_DIR / file_path
+        normalized = re.sub(r"^(?:\.?/)?work/", "", file_path.strip())
+        path = WORK_DIR / normalized
         if not str(path.resolve()).startswith(str(WORK_DIR.resolve())): return "Error: Access denied."
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, 'w', encoding='utf-8') as f:
             f.write(content)
-        return f"Successfully wrote to {file_path}"
+        return f"Successfully wrote to {normalized}"
     except Exception as e:
         return f"Error writing {file_path}: {e}"
 
@@ -74,10 +126,26 @@ def execute_ministry(ministry_key: str, task_desc: str, state: "EdictState",
 
     try:
         role_prompt = load_role_prompt(ministry_key)
+        before_snapshot = snapshot_work_tree()
+        prior_results = state.get("ministry_results", {})
+        prior_artifacts = []
+        for dept_key, result in prior_results.items():
+            if not isinstance(result, dict):
+                continue
+            changes = result.get("file_changes", {})
+            if any(changes.get(k) for k in ["created", "modified", "deleted"]):
+                prior_artifacts.append(
+                    f"- {ROLE_DISPLAY_NAMES.get(dept_key, dept_key)}\n"
+                    f"{format_file_changes(changes)}"
+                )
         context = (
             f"用户请求：{state['user_input']}\n\n"
             f"工作流指定你的任务是：{task_desc}\n\n"
+            f"当前 work/ 文件清单：\n{format_work_tree(before_snapshot)}\n\n"
+            f"前序部门已落盘的文件变更：\n"
+            f"{chr(10).join(prior_artifacts) if prior_artifacts else '暂无前序文件产物。'}\n\n"
             f"说明：你可以使用工具在 {WORK_DIR} 目录下读写文件。"
+            "若任务涉及实现、文档或部署，请优先基于已有文件协作，并把结果真实写入 work/，不要只做文字说明。"
         )
 
         # Select tools based on role
@@ -112,6 +180,7 @@ def execute_ministry(ministry_key: str, task_desc: str, state: "EdictState",
                     f"# {ministry_name} 执行日志\n"
                     f"任务：{task_desc}\n"
                     f"开始时间：{datetime.now().isoformat()}\n"
+                    f"执行前文件清单：\n{format_work_tree(before_snapshot)}\n"
                     f"{'='*60}\n\n"
                 )
                 f.write(header)
@@ -168,15 +237,44 @@ def execute_ministry(ministry_key: str, task_desc: str, state: "EdictState",
             return parts[-1]
 
         output = _stream_to_file(agent)
+        after_snapshot = snapshot_work_tree()
+        file_changes = diff_work_tree(before_snapshot, after_snapshot)
+        artifact_status = "success"
+        if ministry_key in {"bingbu", "gongbu", "libu"} and not any(file_changes.values()):
+            artifact_status = "partial"
+            output = (
+                f"{output}\n\n[系统提示] 该部门具备写文件权限，但本轮未检测到 work/ 文件变更。"
+                " 当前结果更接近文本说明，而非文件级协作产物。"
+            ).strip()
+
+        if output_file:
+            with open(str(output_file), "a", encoding="utf-8") as f:
+                f.write("\n## 文件变更\n")
+                f.write(format_file_changes(file_changes))
+                f.write("\n\n## 执行后文件清单\n")
+                f.write(format_work_tree(after_snapshot))
+                f.write("\n")
 
         logger.info(f"  ← {ministry_name} 执行完成")
-        return {"output": output, "status": "success", "timestamp": datetime.now().isoformat()}
+        return {
+            "output": output,
+            "status": artifact_status,
+            "timestamp": datetime.now().isoformat(),
+            "file_changes": file_changes,
+            "work_snapshot": after_snapshot,
+        }
     except Exception as e:
         logger.error(f"  ← {ministry_name} 执行异常：{e}")
         if output_file:
             with open(str(output_file), "a", encoding="utf-8") as f:
                 f.write(f"\n[ERROR] {datetime.now().isoformat()} {e}\n")
-        return {"output": str(e), "status": "error", "timestamp": datetime.now().isoformat()}
+        return {
+            "output": str(e),
+            "status": "error",
+            "timestamp": datetime.now().isoformat(),
+            "file_changes": {"created": [], "modified": [], "deleted": []},
+            "work_snapshot": snapshot_work_tree(),
+        }
 
 
 # 路径配置
@@ -739,7 +837,9 @@ def _plan_governance_with_llm(state: "EdictState",
     返回 {"xingbu": bool, "hubu": bool, "libu_admin": bool}。
     """
     results_summary = "\n".join(
-        f"- {ROLE_DISPLAY_NAMES.get(k, k)}: {v.get('output', '')[:300]}"
+        f"- {ROLE_DISPLAY_NAMES.get(k, k)}: 状态={v.get('status', '?')}; "
+        f"文件={format_file_changes(v.get('file_changes', {}))}; "
+        f"摘要={v.get('output', '')[:300]}"
         for k, v in ministry_results.items()
     )
     system_prompt = """你是尚书省协调员，负责判断六部执行结果是否需要额外的治理部门介入。
@@ -860,7 +960,9 @@ def shangshu_node(state: EdictState) -> EdictState:
         prior_outputs = ""
         if ministry_results:
             prior_outputs = "\n\n【前序部门产出（供参考）】\n" + "\n".join(
-                f"- {ROLE_DISPLAY_NAMES.get(k, k)}：{v.get('output', '')[:600]}"
+                f"- {ROLE_DISPLAY_NAMES.get(k, k)}：状态={v.get('status', '?')}\n"
+                f"  文件变更：{format_file_changes(v.get('file_changes', {}))}\n"
+                f"  文本摘要：{v.get('output', '')[:400]}"
                 for k, v in ministry_results.items()
             )
 
@@ -1084,9 +1186,11 @@ def menxia_final_node(state: EdictState) -> EdictState:
 
     results_summary = "\n".join(
         f"- {ROLE_DISPLAY_NAMES.get(k, k)}（{v.get('status', '?')}）: "
+        f"文件变更={format_file_changes(v.get('file_changes', {}))}; "
         f"{v.get('output', '')[:400] if isinstance(v, dict) else str(v)[:400]}"
         for k, v in state.get("ministry_results", {}).items()
     )
+    current_workspace = format_work_tree(snapshot_work_tree())
 
     system_prompt = """你是门下省侍中，负责对六部执行成果进行最终质量验收。
 
@@ -1094,6 +1198,7 @@ def menxia_final_node(state: EdictState) -> EdictState:
 1. 各部门执行结果是否完整、无明显错误
 2. 整体方案是否满足用户原始需求
 3. 是否存在安全或合规遗漏
+4. 对于代码、文档、部署类任务，必须优先依据真实文件产物判断，不能仅依据部门自述
 
 输出 JSON：
 {"verdict": "通过" 或 "存疑", "summary": "验收意见", "issues": ["问题1（如无则为空列表）"]}"""
@@ -1101,7 +1206,8 @@ def menxia_final_node(state: EdictState) -> EdictState:
     user_content = (
         f"用户原始任务：{state['user_input']}\n\n"
         f"计划：{state['plan'][:500]}\n\n"
-        f"各部门执行结果：\n{results_summary}"
+        f"各部门执行结果：\n{results_summary}\n\n"
+        f"当前 work/ 文件清单：\n{current_workspace}"
     )
 
     try:
@@ -1132,12 +1238,20 @@ def finalize_node(state: EdictState) -> EdictState:
     log_event_to_db(task_id, "node_start", "finalize", "开始汇总")
 
     ministry_reports = "\n\n".join([
-        f"### {ROLE_DISPLAY_NAMES.get(m, m)}\n{result.get('output', '') if isinstance(result, dict) else str(result)[:1000]}"
+        f"### {ROLE_DISPLAY_NAMES.get(m, m)}\n"
+        f"状态：{result.get('status', '?') if isinstance(result, dict) else '?'}\n"
+        f"文件变更：{format_file_changes(result.get('file_changes', {})) if isinstance(result, dict) else '未知'}\n"
+        f"{result.get('output', '') if isinstance(result, dict) else str(result)[:1000]}"
         for m, result in state.get("ministry_results", {}).items()
     ])
+    workspace_summary = format_work_tree(snapshot_work_tree())
 
     system_prompt = """你是太子太傅，负责汇总六部工作成果。
 请根据以下各部门的报告，生成最终的执行总结。
+
+要求：
+- 明确区分“真实已落盘文件”和“仅文字声称完成”的内容
+- 如果 work/ 中缺少关键代码或文档文件，不得写成“已完成开发”
 
 输出格式：
 # 执行总结
@@ -1157,7 +1271,10 @@ def finalize_node(state: EdictState) -> EdictState:
     user_content = f"""原始任务：{state['user_input']}
 
 各部门报告:
-{ministry_reports}"""
+{ministry_reports}
+
+当前 work/ 文件清单:
+{workspace_summary}"""
 
     try:
         final_report = call_llm_with_retry(system_prompt, user_content, role="final")
