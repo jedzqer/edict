@@ -9,6 +9,7 @@ langgraph-checkpoint>=4.0.1
 langchain>=1.2.14
 langchain-core>=1.2.24
 langchain-openai>=1.1.12
+deepagents>=0.4.12
 
 # 其他依赖（自动安装）
 # - pydantic>=2.7.4

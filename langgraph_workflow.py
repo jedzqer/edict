@@ -393,6 +393,85 @@ def execute_command(command: str) -> str:
     except Exception as e:
         return f"Error executing command: {e}"
 
+
+def _build_deepagents_subagents(ministry_key: str) -> list[dict]:
+    """为执行部门提供可委派的子代理，增强任务拆解与上下文隔离。"""
+    subagents = [
+        {
+            "name": "artifact_writer",
+            "description": "负责把需求落到 work/ 中的实际文件，适合撰写、修改、整理交付物。",
+            "system_prompt": (
+                "你是文件落地产出子代理。优先直接修改或创建 work/ 内文件，"
+                "不要只给建议；完成后汇报改了哪些文件、为什么这样改。"
+            ),
+        },
+        {
+            "name": "artifact_reviewer",
+            "description": "负责审查 work/ 中已有文件是否满足当前任务与验收标准。",
+            "system_prompt": (
+                "你是交付物审查子代理。检查 work/ 中真实文件与任务要求是否一致，"
+                "指出缺口、风险和需要补齐的内容；不要编造未存在的文件。"
+            ),
+        },
+    ]
+
+    if ministry_key == "gongbu":
+        subagents.append(
+            {
+                "name": "command_executor",
+                "description": "负责在 work/ 目录内运行必要命令，验证实现、构建或调试问题。",
+                "system_prompt": (
+                    "你是命令执行子代理。仅在有明确必要时才运行命令；"
+                    "优先使用最小命令验证，汇报执行结果、失败原因和后续建议。"
+                ),
+            }
+        )
+
+    return subagents
+
+
+def _create_ministry_agent(ministry_key: str, llm: "ChatOpenAI", role_prompt: str, tools: list[Any]):
+    """按部门能力选择 agent 实现；执行部门优先使用 deepagents。"""
+    if ministry_key in {"libu", "bingbu", "gongbu"}:
+        from deepagents import create_deep_agent
+        from deepagents.backends.filesystem import FilesystemBackend
+        from deepagents.backends.local_shell import LocalShellBackend
+
+        backend = FilesystemBackend(root_dir=WORK_DIR, virtual_mode=True)
+        if ministry_key == "gongbu":
+            backend = LocalShellBackend(
+                root_dir=WORK_DIR,
+                virtual_mode=True,
+                timeout=30,
+                inherit_env=True,
+            )
+
+        deep_prompt = (
+            f"{role_prompt}\n\n"
+            "你运行在三省六部制工作流的执行部门中。\n"
+            "硬约束：\n"
+            "1. 真实产物优先，结果应尽量落到 work/ 目录，而不是停留在文字说明。\n"
+            "2. 如任务较复杂，主动使用 write_todos 拆解，再视情况使用 task 委派子代理。\n"
+            "3. 文件路径一律按当前 backend 根目录处理；不要尝试访问 work/ 之外的路径。\n"
+            "4. 若需要执行命令，只做与当前任务直接相关的最小验证。\n"
+        )
+        return create_deep_agent(
+            model=llm,
+            tools=[],
+            system_prompt=deep_prompt,
+            backend=backend,
+            subagents=_build_deepagents_subagents(ministry_key),
+        )
+
+    # 非执行部门保持轻量 agent，避免把审批/治理节点变成通用 coding agent。
+    try:
+        from langchain.agents import create_agent
+        return create_agent(llm, tools=tools, system_prompt=role_prompt)
+    except ImportError:
+        from langgraph.prebuilt import create_react_agent
+        return create_react_agent(llm, tools=tools, prompt=role_prompt)
+
+
 def execute_ministry(ministry_key: str, task_desc: str, state: "EdictState",
                      logger: logging.Logger, task_dir: Optional[Path] = None) -> dict:
     ministry_name = ROLE_DISPLAY_NAMES.get(ministry_key, ministry_key)
@@ -432,15 +511,7 @@ def execute_ministry(ministry_key: str, task_desc: str, state: "EdictState",
             tools.append(execute_command)
 
         llm = _get_llm_for_role(ministry_key)
-
-        # 优先使用 LangChain 1.x 的 create_agent，避免依赖已弃用的
-        # langgraph.prebuilt.create_react_agent；旧环境下再回退。
-        try:
-            from langchain.agents import create_agent
-            agent = create_agent(llm, tools=tools, system_prompt=role_prompt)
-        except ImportError:
-            from langgraph.prebuilt import create_react_agent
-            agent = create_react_agent(llm, tools=tools, prompt=role_prompt)
+        agent = _create_ministry_agent(ministry_key, llm, role_prompt, tools)
 
         def _stream_to_file(agent_obj) -> str:
             """流式执行并实时写入输出文件，返回最终输出文本"""
