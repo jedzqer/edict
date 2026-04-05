@@ -273,21 +273,13 @@ def normalize_dispatch_department(task_desc: str, dept_key: str) -> str:
     )
 
     # 只修正明确的职责冲突，不根据模糊词跨部门改派。
-    # 当前制度下：兵部负责代码实现（前后端），礼部负责文档，工部负责部署与验证。
+    # 当前制度下：兵部与工部均为通用编码执行角色，不区分前后端；礼部负责文档；工部/兵部均可执行部署验证。
     if docs_only_paths:
         return "libu"
-    if dept_key == "gongbu" and (has_frontend or has_backend) and not has_deploy:
-        return "bingbu"
-    if dept_key == "bingbu" and has_deploy and not has_frontend and not has_backend:
-        return "gongbu"
     if dept_key in {"bingbu", "gongbu"} and has_docs and not has_frontend and not has_backend and not has_deploy:
         return "libu"
-    if dept_key == "libu" and has_backend and not has_docs:
+    if dept_key == "libu" and (has_backend or has_frontend or has_deploy) and not has_docs:
         return "bingbu"
-    if dept_key == "libu" and has_frontend and not has_docs:
-        return "bingbu"
-    if dept_key == "libu" and has_deploy and not has_docs:
-        return "gongbu"
     if dept_key == "gongbu" and has_docs and not has_deploy and not has_frontend and not has_backend:
         return "libu"
     return dept_key
@@ -408,7 +400,7 @@ def allow_parallel_frontend_backend(
     plan_contracts: Dict[str, Any],
     logger: logging.Logger,
 ) -> list[dict]:
-    """在接口契约已明确时，允许兵部与工部并发开发，联调再后置。"""
+    """在模块边界已明确时，允许兵部与工部并发开发，联调再后置。"""
     if not plan_contracts.get("interface_contracts"):
         return stages
 
@@ -448,7 +440,7 @@ def allow_parallel_frontend_backend(
         merged["departments"] = list(current.get("departments", [])) + list(nxt.get("departments", []))
         optimized.append(merged)
         logger.info(
-            "尚书省阶段优化：检测到中书省已提供接口契约，合并相邻阶段以并发执行兵部/工部开发。"
+            "尚书省阶段优化：检测到模块边界已明确，合并相邻阶段以并发执行兵部/工部开发。"
         )
         idx += 2
 
@@ -511,7 +503,7 @@ def _build_deepagents_subagents(ministry_key: str) -> list[dict]:
         },
     ]
 
-    if ministry_key == "gongbu":
+    if ministry_key in {"bingbu", "gongbu"}:
         subagents.append(
             {
                 "name": "command_executor",
@@ -534,7 +526,7 @@ def _create_ministry_agent(ministry_key: str, llm: "ChatOpenAI", role_prompt: st
         from deepagents.backends.local_shell import LocalShellBackend
 
         backend = FilesystemBackend(root_dir=WORK_DIR, virtual_mode=False)
-        if ministry_key == "gongbu":
+        if ministry_key in {"bingbu", "gongbu"}:
             backend = LocalShellBackend(
                 root_dir=WORK_DIR,
                 virtual_mode=False,
@@ -611,7 +603,7 @@ def execute_ministry(ministry_key: str, task_desc: str, state: "EdictState",
         tools = [read_file]
         if ministry_key in ["bingbu", "gongbu", "libu"]:
             tools.append(write_file)
-        if ministry_key == "gongbu":
+        if ministry_key in ["bingbu", "gongbu"]:
             tools.append(execute_command)
 
         llm = _get_llm_for_role(ministry_key)
@@ -956,9 +948,9 @@ ROLE_CAPABILITIES: Dict[str, set] = {
     "libu_admin": {"组织治理"},
     "hubu":       {"资源治理"},
     "libu":       {"文事执行"},
-    "bingbu":     {"技术执行"},
+    "bingbu":     {"通用编码执行"},
     "xingbu":     {"风险审查"},
-    "gongbu":     {"工事执行"},
+    "gongbu":     {"通用编码执行"},
 }
 
 
@@ -1485,13 +1477,12 @@ def shangshu_node(state: EdictState) -> EdictState:
     执行规则：
     - 若某部门的输出会影响另一个部门的工作（如户部的资源建议要传递给兵部），则户部放早期阶段，兵部放后续阶段
     - 派工前必须先从计划中确认统一项目根目录，并在任务描述里显式写出 `work/<项目名>/...` 目标路径
-    - 兵部负责后端代码与服务逻辑；工部负责前端页面、HTML/CSS/JS、构建、依赖安装、启动验证与部署；礼部负责 README、说明文档、接口文档与文案
-    - 若中书省已经提供明确的 interface_contracts（接口路径、请求响应、共享数据结构），则兵部与工部可以在同一阶段并发开发，不要机械拆成“兵部先写、工部后写”
-    - 前后端并发开发时，应把“按既定接口契约分别实现”写入兵部和工部任务；联调、启动验证、端到端测试可放到后续阶段
+    - 兵部与工部均为通用编码与指令执行角色，不区分前端/后端，均可使用 write_file、read_file、execute_command 工具
+    - 简单任务（单一功能点、改动集中）：派发给兵部或工部中的一个部门独立完成，无需并发
+    - 复杂任务（涉及多个模块、有明确可拆分边界）：并发派发至兵部与工部，尚书省必须为二者明确划分各自负责的模块边界，写入任务描述
+    - 兵部与工部并发时，联调、启动验证、端到端测试可放到后续阶段
+    - 礼部负责 README、说明文档、接口文档与文案；不要把文档任务派给兵部或工部
     - 吏部只负责组织治理，不承担虚拟环境创建、依赖安装、测试执行、部署验证
-- Python 虚拟环境、依赖安装、启动验证、部署脚本只能交给工部，不要派给吏部、户部或礼部
-- HTML/CSS/JS、前端页面、动画和浏览器交互只能交给工部，不要派给兵部
-- 后端 Python、API、服务逻辑、数据持久化只能交给兵部，不要派给工部
 - README、说明文档、接口文档只能交给礼部，不要派给兵部或工部
 - 若任务不涉及某部门，直接不分配，不要编造无意义的任务
 - 如当前已经存在执行结果或门下省/上级给出“存疑”意见，本轮应优先安排补齐缺失产物的返工任务，而不是重新发散规划
